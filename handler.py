@@ -14,18 +14,20 @@ import time
 from pathlib import Path
 
 from facade.geometry import FrameContext, WallPlane
-from facade.outputs import build_sidecar, write_json, write_preview, write_tiff, write_tiles
+from facade.outputs import (build_sidecar, write_full_jpeg, write_json, write_preview, write_tiff,
+                            write_tiles)
 from facade.pipeline import FacadeOptions, run_facade
 from facade.project import load_project, safe_extract
 from facade.transfer import download, refresh_upload_urls, require_http_url, upload
 
-WORKER_VERSION = "2026-10-03.2"
+WORKER_VERSION = "2026-10-03.3"
 GB = 1024 ** 3
 DISK_HEADROOM_FACTOR = 2.5
 
 # payload key -> (output file, content type, required)
 UPLOADS = {
     "ortho_upload_url": ("facade.tif", "image/tiff", True),
+    "jpeg_upload_url": ("facade.jpg", "image/jpeg", False),
     "sidecar_upload_url": ("facade.json", "application/json", False),
     "preview_upload_url": ("facade_preview.jpg", "image/jpeg", False),
     "tiles_upload_url": ("facade_tiles.zip", "application/zip", False),
@@ -109,13 +111,19 @@ def produce(project_dir: Path, job_input: dict, out_dir: Path, progress=None) ->
             "project_id": job_input.get("project_id"),
             "wall_name": job_input.get("wall_name"),
             "worker_version": WORKER_VERSION,
-            "files": {"ortho": "facade.tif", "preview": "facade_preview.jpg"},
+            "files": {"ortho": "facade.tif", "jpeg": "facade.jpg", "preview": "facade_preview.jpg"},
         })
         if progress:
             progress("Writing TIFF")
         write_tiff(raster, out_dir / "facade.tif", grid.gsd_m,
                    description=json.dumps({"kind": sidecar["kind"], "gsd_m": grid.gsd_m,
                                            "plane": sidecar["plane"]["opensfm"]}))
+        jw, jh, jscale = write_full_jpeg(raster, out_dir / "facade.jpg")
+        sidecar["jpeg"] = {"width_px": jw, "height_px": jh, "scale": round(jscale, 6),
+                           "gsd_mm": round(grid.gsd_m * 1000 / jscale, 4)}
+        if jscale < 1:
+            sidecar["warnings"].append(
+                f"facade.jpg was reduced to {jw}x{jh} (JPEG's size limit); facade.tif is full resolution")
         pw, ph = write_preview(raster, out_dir / "facade_preview.jpg")
         sidecar["preview"] = {"width_px": pw, "height_px": ph}
         want_tiles = bool(job_input.get("tiles_upload_url")) or bool(job_input.get("make_tiles"))

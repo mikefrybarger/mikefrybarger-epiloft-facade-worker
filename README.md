@@ -70,6 +70,7 @@ textured mesh vertices.
     "gsd_mm": "native",
     "ortho_upload_url":   "https://SIGNED-UPLOAD-URL",
     "sidecar_upload_url": "https://OPTIONAL",
+    "jpeg_upload_url":    "https://OPTIONAL (recommended: the file people open)",
     "preview_upload_url": "https://OPTIONAL",
     "tiles_upload_url":   "https://OPTIONAL",
     "upload_url_refresh_url": "https://OPTIONAL per-job re-sign route",
@@ -104,9 +105,10 @@ All optional. Unknown keys are rejected so a typo never silently does nothing.
 | `max_incidence_deg` | 65 | Views more oblique than this are not used. |
 | `min_standoff_m` | 0.5 | Camera must be at least this far in front of the wall. |
 | `max_cameras` | 80 | Photos used per wall. |
+| `top_per_cell` | 6 | Photos occlusion-checked per wall spot per round. All candidates are scored on geometry first; only likely winners get the expensive occlusion check. |
 | `edge_margin` | 0.02 | Fraction of each frame edge ignored. |
 | `blend_levels` | 5 | Pyramid levels. More = wider brightness blending across seams. |
-| `gain_sigma_g` | 1.0 | Exposure gain prior. Lower pulls gains toward 1 (OpenCV uses 0.1, which leaves real exposure steps visible). |
+| `gain_sigma_g` | 1.0 | Exposure gain prior. Lower pulls gains toward 1 (OpenCV uses 0.1, which leaves real exposure steps visible). Gains are then rescaled so their overlap-weighted geometric mean is 1, so levelling never darkens the facade. |
 | `zbuffer_cells_per_spacing` | 1.5 | Occlusion z-buffer cell size, in point spacings. |
 | `zbuffer_downscale` | auto | Force the z-buffer cell size in source pixels. |
 | `occlusion_abs_tol_m` / `occlusion_rel_tol` | 0.08 / 0.01 | How far behind the z-buffer a point may sit and still count as visible. |
@@ -117,7 +119,8 @@ All optional. Unknown keys are rejected so a typo never silently does nothing.
 
 | File | What it is |
 |---|---|
-| `facade.tif` | Tiled BigTIFF, RGBA, lossless (zlib). Transparent where no photo saw that spot unobstructed. DPI tags carry the real scale. |
+| `facade.jpg` | **The one to open.** Full-resolution JPEG, white where no photo saw the wall. Opens in any viewer, browser or phone. (Reduced only past JPEG's 65,535 px limit, with a warning.) |
+| `facade.tif` | Tiled RGBA TIFF, lossless LZW; classic TIFF unless over ~3.5 GB. Transparent where no photo saw that spot unobstructed. DPI tags carry the real scale. For CAD and GIS. |
 | `facade.json` | The sidecar: plane in OpenSfM and mesh frames, scale, pixel to wall to world maths, depth stats, photos used with share, distance and gain, warnings, timings, effective options. |
 | `facade_preview.jpg` | Long edge up to 4096 px, alpha flattened onto white. |
 | `facade_tiles.zip` | Deep Zoom pyramid (`.dzi` + PNG tiles), only when `tiles_upload_url` is set. |

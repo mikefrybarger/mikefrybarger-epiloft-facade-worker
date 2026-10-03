@@ -89,6 +89,7 @@ def test_handler_round_trip(server):
         "ortho_upload_url": server.url("/up/facade.tif"),
         "sidecar_upload_url": server.url("/up/facade.json"),
         "preview_upload_url": server.url("/up/preview.jpg"),
+        "jpeg_upload_url": server.url("/up/facade.jpg"),
         "upload_url_refresh_url": server.url("/refresh"),
     }}
     result = handler.handler(job)
@@ -103,6 +104,12 @@ def test_handler_round_trip(server):
     assert meta["project_id"] == "synthetic" and meta["wall_name"] == "south"
     assert meta["plane"]["mesh"]["bottom_left"]  # mesh-frame corners echoed back for Studio
     assert server.uploads["/up/preview.jpg"][:2] == b"\xff\xd8"
+    assert server.headers["/up/facade.jpg"] == "image/jpeg"
+    from PIL import Image
+    full = Image.open(io.BytesIO(server.uploads["/up/facade.jpg"]))
+    assert full.size == (meta["image"]["width_px"], meta["image"]["height_px"])
+    tif = tifffile.TiffFile(io.BytesIO(server.uploads["/up/refreshed.tif"]))
+    assert not tif.is_bigtiff and tif.pages[0].compression == 5   # classic TIFF, LZW
     assert any("Blending" in m for m in progress_log)
 
 

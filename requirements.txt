@@ -3,6 +3,7 @@ requests>=2.31,<3
 numpy>=1.26,<3
 opencv-python-headless>=4.9,<5
 tifffile>=2024.2.12
+imagecodecs>=2024.1.1
 pillow>=10
 laspy[lazrs]>=2.5,<3
 pyvips[binary]>=2.2,<4

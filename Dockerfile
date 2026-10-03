@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m pip install -r /tmp/requirements.txt \
-    && python3 -c "import cv2, numpy, tifffile, laspy, pyvips, scipy, pyproj; print('deps ok, vips', pyvips.version(0), pyvips.version(1))"
+    && python3 -c "import cv2, numpy, tifffile, imagecodecs, laspy, pyvips, scipy, pyproj; print('deps ok, vips', pyvips.version(0), pyvips.version(1))"
 
 WORKDIR /worker
 COPY facade /worker/facade

@@ -25,6 +25,7 @@ class SelectionConfig:
     min_standoff_m: float = 0.5       # camera must be at least this far in front of the wall
     edge_margin: float = 0.02         # ignore this fraction of the frame at each edge
     max_cameras: int = 80             # cap on photos used per wall
+    top_per_cell: int = 6             # photos occlusion-checked per wall spot, per round
     min_cells: int = 4                # photo must win or cover this many coarse cells
     smooth_passes: int = 2            # mode-filter passes on the coarse label map
     gain_sigma_n: float = 10.0        # intensity noise, 0-255 scale (OpenCV's default)
@@ -124,5 +125,18 @@ def solve_gains(samples: np.ndarray, valid: np.ndarray, cfg: SelectionConfig) ->
             continue
         sol, *_ = np.linalg.lstsq(np.asarray(rows), np.asarray(rhs), rcond=None)
         sol = np.where(totals > 0, sol, 1.0)
-        gains[:, c] = np.clip(sol, *cfg.gain_clamp)
-    return gains
+        gains[:, c] = sol
+    # The pairwise terms only fix gains relative to each other. With many
+    # photos and imperfect overlaps, shrinking every gain lowers that cost,
+    # so the raw solution drifts dark (a real 80-photo job sat every photo on
+    # the 0.5 floor). Rescale so the facade keeps the capture's typical
+    # exposure: an overlap-weighted, trimmed geometric mean of the gains is 1.
+    weight = valid.sum(axis=1).astype(np.float64)
+    if weight.sum() > 0:
+        lum = np.maximum(gains @ np.array([0.114, 0.587, 0.299]), 1e-6)   # BGR luma
+        logs = np.log(lum)
+        lo, hi = np.percentile(logs, [10, 90]) if n >= 10 else (logs.min(), logs.max())
+        keep = (logs >= lo) & (logs <= hi) & (weight > 0)
+        if keep.any():
+            gains /= np.exp(np.average(logs[keep], weights=weight[keep]))
+    return np.clip(gains, *cfg.gain_clamp)

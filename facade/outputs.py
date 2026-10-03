@@ -6,6 +6,8 @@
 * ``facade.json`` sidecar: the plane, the pixel -> wall -> world maths, scale,
   photos used, warnings. This (not GeoTIFF tags) is the georeferencing: a
   vertical wall has no meaningful map projection.
+* ``facade.jpg``  full-resolution JPEG, alpha flattened onto white. The file
+  people actually open: every viewer, browser and phone reads it.
 * ``facade_preview.jpg``  long edge <= 4096, alpha flattened onto white.
 * ``facade_tiles.zip``  Deep Zoom (DZI) pyramid, only when pyvips is present.
 """
@@ -20,21 +22,44 @@ import numpy as np
 
 SIDECAR_VERSION = 1
 PREVIEW_LONG_EDGE = 4096
+JPEG_MAX_SIDE = 65_500          # JPEG's hard limit is 65,535 px per side
+BIGTIFF_THRESHOLD = 3_500_000_000
 
 
 def write_tiff(raster: np.ndarray, path: Path, gsd_m: float, description: str = ""):
+    """Tiled RGBA TIFF. Classic TIFF (not BigTIFF) whenever it fits, and LZW,
+    the compression the widest range of viewers and CAD tools read."""
     import tifffile  # noqa: PLC0415
 
     px_per_cm = 1.0 / (gsd_m * 100.0)
     tifffile.imwrite(
-        path, raster, bigtiff=True, tile=(512, 512), photometric="rgb",
-        extrasamples=["unassalpha"], compression="zlib",
+        path, raster, bigtiff=raster.nbytes > BIGTIFF_THRESHOLD, tile=(512, 512), photometric="rgb",
+        extrasamples=["unassalpha"], compression="lzw",
         resolution=(px_per_cm, px_per_cm), resolutionunit="CENTIMETER",
         description=description, software="epiloft-facade-worker", metadata=None,
     )
 
 
-def write_preview(raster: np.ndarray, path: Path, long_edge: int = PREVIEW_LONG_EDGE):
+def write_full_jpeg(raster: np.ndarray, path: Path, quality: int = 92):
+    """Full-resolution JPEG (downscaled only past JPEG's 65,535 px limit).
+
+    Returns (width, height, scale) where scale < 1 means it was reduced."""
+    h, w = raster.shape[:2]
+    if max(h, w) > JPEG_MAX_SIDE:
+        tw, th = write_preview(raster, path, long_edge=JPEG_MAX_SIDE, quality=quality)
+        return tw, th, tw / w
+    img = np.empty((h, w, 3), dtype=np.uint8)
+    for y0 in range(0, h, 2048):
+        band = np.asarray(raster[y0:y0 + 2048]).astype(np.float32)
+        a = band[..., 3:4] / 255.0
+        img[y0:y0 + 2048] = np.clip(band[..., :3] * a + 255.0 * (1.0 - a), 0, 255).astype(np.uint8)[..., ::-1]
+    if not cv2.imwrite(str(path), img, [cv2.IMWRITE_JPEG_QUALITY, quality,
+                                        cv2.IMWRITE_JPEG_OPTIMIZE, 1]):
+        raise RuntimeError("could not write the full-resolution JPEG")
+    return w, h, 1.0
+
+
+def write_preview(raster: np.ndarray, path: Path, long_edge: int = PREVIEW_LONG_EDGE, quality: int = 88):
     h, w = raster.shape[:2]
     scale = min(1.0, long_edge / max(h, w))
     tw, th = max(1, round(w * scale)), max(1, round(h * scale))
@@ -49,7 +74,7 @@ def write_preview(raster: np.ndarray, path: Path, long_edge: int = PREVIEW_LONG_
         flat = band[..., :3] * a + 255.0 * (1.0 - a)
         rows.append(cv2.resize(flat, (tw, y1 - y0), interpolation=cv2.INTER_AREA))
     img = np.clip(np.concatenate(rows, axis=0), 0, 255).astype(np.uint8)
-    cv2.imwrite(str(path), img[..., ::-1], [cv2.IMWRITE_JPEG_QUALITY, 88])
+    cv2.imwrite(str(path), img[..., ::-1], [cv2.IMWRITE_JPEG_QUALITY, quality])
     return tw, th
 
 

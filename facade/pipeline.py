@@ -152,31 +152,75 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
     cgrid = OrthoGrid.for_plane(plane, coarse_cell)
     cu, cv = cgrid.uv(0, cgrid.height_px, 0, cgrid.width_px)
     cpts = plane.to_world(cu, cv, depth.sample(cu, cv))
-    n = len(candidates)
-    scores = np.full((n, cgrid.height_px, cgrid.width_px), -np.inf, dtype=np.float32)
-    gsds = np.full_like(scores, np.nan)
-    samples = np.zeros((n, cgrid.height_px, cgrid.width_px, 3), dtype=np.float32)
-    zbuffers = {}
+    # Pass A: geometry-only scores for every candidate (cheap).
+    n_all = len(candidates)
+    raw_scores = np.full((n_all, cgrid.height_px, cgrid.width_px), -np.inf, dtype=np.float32)
+    projections = []
     for k, shot in enumerate(candidates):
         px, py, d = shot.project(cpts)
         sc, g = score_views(shot, cpts, plane.w, px, py, d, sel)
-        if not np.isfinite(sc).any():
-            continue
-        dist = float(np.nanmedian(d[np.isfinite(sc)]))
-        zb = ZBuffer(shot, occluders, opts.visibility,
-                     downscale=opts.visibility.downscale
-                     or auto_downscale(shot, dist, point_spacing, opts.visibility))
-        sc = np.where(zb.visible(px, py, d), sc, -np.inf)
-        if not np.isfinite(sc).any():
-            continue
-        zbuffers[shot.name] = zb
-        scores[k], gsds[k] = sc, g
+        raw_scores[k] = sc
+        projections.append((px, py, d, g))
+
+    # Pass B: occlusion only for photos that could win somewhere. Each round
+    # takes the top few photos at every still-uncovered cell; cells whose best
+    # photos turn out to be blocked get the next ones in the following round.
+    tried = np.zeros(n_all, dtype=bool)
+    shortlist = []
+    vis_scores, vis_gsds, zbuffers = {}, {}, {}
+    uncovered = np.isfinite(raw_scores).any(axis=0)
+    for _round in range(4):
+        if not uncovered.any():
+            break
+        masked = np.where(tried[:, None, None], -np.inf, raw_scores)
+        masked = np.where(uncovered[None], masked, -np.inf)
+        top = min(sel.top_per_cell, n_all)
+        best = np.argpartition(-masked.reshape(n_all, -1), top - 1, axis=0)[:top]
+        best_ok = np.take_along_axis(masked.reshape(n_all, -1), best, axis=0) > -np.inf
+        picks = np.unique(best[best_ok])
+        picks = [int(k) for k in picks if not tried[k]]
+        if not picks:
+            break
+        for k in picks:
+            tried[k] = True
+            shot = candidates[k]
+            px, py, d, g = projections[k]
+            sc = raw_scores[k]
+            dist = float(np.nanmedian(d[np.isfinite(sc)]))
+            zb = ZBuffer(shot, occluders, opts.visibility,
+                         downscale=opts.visibility.downscale
+                         or auto_downscale(shot, dist, point_spacing, opts.visibility))
+            sc = np.where(zb.visible(px, py, d), sc, -np.inf)
+            if np.isfinite(sc).any():
+                shortlist.append(k)
+                vis_scores[k], vis_gsds[k], zbuffers[shot.name] = sc, g, zb
+        covered_now = np.zeros_like(uncovered)
+        for k in shortlist:
+            covered_now |= np.isfinite(vis_scores[k])
+        uncovered = np.isfinite(raw_scores).any(axis=0) & ~covered_now
+    del raw_scores
+
+    n = len(shortlist)
+    if n == 0:
+        raise RuntimeError("no photo sees this wall unobstructed; check the wall corners and the capture")
+    candidates_checked = int(tried.sum())
+    _log(progress, f"Occlusion-checked {candidates_checked} of {n_all} photos; {n} see the wall")
+    scores = np.stack([vis_scores[k] for k in shortlist])
+    gsds = np.stack([vis_gsds[k] for k in shortlist])
+    samples = np.zeros((n, cgrid.height_px, cgrid.width_px, 3), dtype=np.float32)
+    candidates = [candidates[k] for k in shortlist]
+    for j, k in enumerate(shortlist):
+        shot = candidates[j]
+        px, py, _, _ = projections[k]
         small = read_image(shot.image_path, reduce=8)
         sw, sh = shot.size()
         fx, fy = small.shape[1] / sw, small.shape[0] / sh
-        samples[k] = cv2.remap(small, ((px + 0.5) * fx - 0.5).astype(np.float32),
-                               ((py + 0.5) * fy - 0.5).astype(np.float32),
-                               cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+        ok = np.isfinite(scores[j])
+        mx = np.where(ok, (px + 0.5) * fx - 0.5, -1.0).astype(np.float32)
+        my = np.where(ok, (py + 0.5) * fy - 0.5, -1.0).astype(np.float32)
+        samples[j] = cv2.remap(small, mx, my, cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+    del projections
 
     valid = np.isfinite(scores)
     covered = valid.any(axis=0)
@@ -269,9 +313,10 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
             level = int(np.clip(math.floor(math.log2(max(gsd_m / max(gm, 1e-9), 1.0))), 0, 4))
             src = cache.get(shot, level)
             f = 2.0 ** level
-            sampled = cv2.remap(src, ((px + 0.5) / f - 0.5).astype(np.float32),
-                                ((py + 0.5) / f - 0.5).astype(np.float32),
-                                cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+            mx = np.where(ok, (px + 0.5) / f - 0.5, -1.0).astype(np.float32)
+            my = np.where(ok, (py + 0.5) / f - 0.5, -1.0).astype(np.float32)
+            sampled = cv2.remap(src, mx, my, cv2.INTER_CUBIC,
+                                borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
             imgs.append(sampled * gains[k][None, None, :].astype(np.float32))
             fscores.append(np.where(ok, sc, -np.inf))
             fvalid.append(ok)
@@ -335,7 +380,8 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         "coverage_coarse": round(coverage_coarse, 4),
         "depth": depth.stats(),
         "occluder_points": int(len(occluders)),
-        "candidates_considered": len(candidates),
+        "candidates_considered": n_all,
+        "candidates_occlusion_checked": candidates_checked,
         "cameras_used": cams_used,
         "image_decodes": cache.decodes,
         "warnings": warnings,

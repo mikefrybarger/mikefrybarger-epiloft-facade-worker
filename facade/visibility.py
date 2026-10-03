@@ -66,12 +66,15 @@ class ZBuffer:
         self.zbuf = zbuf
 
     def visible(self, px: np.ndarray, py: np.ndarray, depth: np.ndarray) -> np.ndarray:
+        """False for points the photo cannot see, including off-image or behind it."""
         s = self.downscale
-        ix = np.clip(((px + 0.5) / s).astype(np.int64), 0, self.zw - 1)
-        iy = np.clip(((py + 0.5) / s).astype(np.int64), 0, self.zh - 1)
+        w, h = self.zw * s, self.zh * s
+        inside = np.isfinite(px) & np.isfinite(py) & (px > -1) & (py > -1) & (px < w) & (py < h)
+        ix = np.clip((np.where(inside, px, 0.0) + 0.5) / s, 0, self.zw - 1).astype(np.int64)
+        iy = np.clip((np.where(inside, py, 0.0) + 0.5) / s, 0, self.zh - 1).astype(np.int64)
         z = self.zbuf[iy, ix]
         tol = self.cfg.abs_tol_m + self.cfg.rel_tol * depth
-        return depth <= z + tol
+        return inside & (depth <= z + tol)
 
 
 def occluder_points(points_wall: np.ndarray, points_world: np.ndarray, width_m: float,

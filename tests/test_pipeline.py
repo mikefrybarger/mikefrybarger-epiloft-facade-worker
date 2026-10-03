@@ -45,6 +45,9 @@ def _compare(rgba, gsd_m):
     ok[:m], ok[-m:], ok[:, :m], ok[:, -m:] = False, False, False, False
     # global brightness differs (gains pull toward 1, truth is gain 1)
     scale = (truth[ok] * got[ok]).sum() / (got[ok] ** 2).sum()
+    # Overall brightness must be right, not just fitted away: a facade that
+    # comes out dark is a failed facade (see the gain normalisation fix).
+    assert 0.85 < scale < 1.15, f"output brightness off by x{1 / scale:.2f}"
     err = got[ok] * scale - truth[ok]
     psnr = 10 * np.log10(255 ** 2 / np.mean(err ** 2))
     shift, _ = cv2.phaseCorrelate(cv2.cvtColor(truth.astype(np.float32), cv2.COLOR_RGB2GRAY),
@@ -292,3 +295,28 @@ def test_local_snap_never_invents_unconstrained_motion(tmp_path):
     assert abs(snap @ syn.W + delta @ syn.W) < 0.01, frame   # through-wall error removed
     assert abs(snap @ syn.U + delta @ syn.U) < 0.02, frame   # along-wall, via the post
     assert abs(snap @ syn.V) < 0.005, frame                  # vertical: nothing invented
+
+
+def test_many_photos_do_not_drift_dark():
+    """Regression: on a real 80-photo job every gain sat on the 0.5 floor and
+    the facade came out dark. The pairwise terms only fix relative gains;
+    systematic differences between overlapping photos (shadows moving during
+    the flight, glass, sheen) make shrinking every gain look cheaper. The old
+    solve drops to ~0.74 on this case and keeps falling as photos disagree more."""
+    from facade.selection import SelectionConfig, solve_gains
+
+    rng = np.random.default_rng(0)
+    n, cells = 80, 4000
+    true_gain = rng.uniform(0.8, 1.2, n)
+    scene = rng.uniform(40, 220, (cells, 3))
+    valid = np.zeros((n, cells), bool)
+    for i in range(n):  # heavy overlap along a long wall
+        start = int(i * cells / n)
+        valid[i, max(0, start - 750): start + 750] = True
+    smooth = np.repeat(rng.normal(0, 0.2, (n, cells // 100 + 1)), 100, axis=1)[:, :cells]
+    samples = scene[None] * true_gain[:, None, None] * (1 + smooth)[:, :, None]
+    gains = solve_gains(samples, valid, SelectionConfig())
+    corrected = gains.mean(axis=1) * true_gain
+    assert 0.95 < np.median(gains) < 1.05, np.median(gains)
+    assert (gains > 0.5 + 1e-6).all() and (gains < 2.0 - 1e-6).all()
+    assert np.std(corrected) / np.mean(corrected) < 0.08
