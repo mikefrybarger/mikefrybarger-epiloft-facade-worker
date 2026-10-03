@@ -19,10 +19,11 @@ import numpy as np
 
 from .blend import multiband_blend
 from .depth import build_depth_map, flat_depth
+from .georef import local_snap
 from .geometry import OrthoGrid, WallPlane
 from .images import ImageCache, read_image
 from .selection import SelectionConfig, mode_filter, prefilter_shots, score_views, solve_gains
-from .visibility import VisibilityConfig, ZBuffer, auto_downscale, occluder_points
+from .visibility import VisibilityConfig, ZBuffer, auto_downscale
 
 
 @dataclass
@@ -77,14 +78,45 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
     if plane.face_cameras(centers, axes):
         warnings.append("wall normal was flipped to face the cameras; image reads left to right from outside")
 
+    # --- candidate photos (decides how far out the cloud needs reading) ------
+    sel = opts.selection
+    candidates = prefilter_shots(shots, plane, sel)
+    if not candidates:
+        hint = ""
+        if project.frame_report and project.frame_report.get("warnings"):
+            hint = " Note: " + "; ".join(project.frame_report["warnings"])
+        raise RuntimeError("no photos look at this wall from in front of it; check the wall corners "
+                           "or fly oblique passes facing this side." + hint)
+    reach = float(max(((s.center - plane.origin) @ plane.w) for s in candidates)) + 1.0
+
     # --- stage 3: surface depth ---------------------------------------------
     phase = time.time()
-    points_world, pc_source = (None, None)
+    points_wall, occluders = None, np.zeros((0, 3))
     point_spacing = 0.05  # fallback when the cloud does not cover the wall
-    if opts.use_point_cloud and project.points is not None:
-        points_world, pc_source = project.points, project.points_source
-    if points_world is not None:
-        points_wall = plane.to_wall(points_world)
+    pc_source = project.points_source
+    if opts.use_point_cloud and project.cloud is not None:
+        _log(progress, f"Reading geometry near the wall from {pc_source}")
+        surface, between, cloud_stats = project.cloud.wall_region(
+            plane, depth_front_m=opts.depth_front_m, depth_back_m=opts.depth_back_m,
+            reach_m=reach, max_occluders=opts.max_occluder_points)
+        if cloud_stats["surface_capped"]:
+            warnings.append("wall surface had more points than the cap; depth used a uniform sample")
+        region = np.concatenate([surface, between])
+        del between
+        if project.frame_report is not None:
+            # fine snap against full-density geometry, before occluders are capped
+            local = local_snap(project.shots, project.sparse, region, plane)
+            warnings.extend(local.pop("warnings"))
+            project.frame_report.update(local)
+            _log(progress, f"Local alignment at the wall: fit {local['local_fit_m']} m, "
+                           f"snap {local['local_snap_m']}")
+        occluders = region
+        if len(occluders) > opts.max_occluder_points:
+            rng = np.random.default_rng(0)
+            occluders = occluders[rng.choice(len(occluders), opts.max_occluder_points, replace=False)]
+        del region
+        points_wall = plane.to_wall(surface) if len(surface) else None
+    if points_wall is not None:
         near = ((points_wall[:, 0] >= 0) & (points_wall[:, 0] < plane.width_m)
                 & (points_wall[:, 1] >= 0) & (points_wall[:, 1] < plane.height_m)
                 & (points_wall[:, 2] <= opts.depth_front_m) & (points_wall[:, 2] >= -opts.depth_back_m))
@@ -100,29 +132,16 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         depth = build_depth_map(points_wall, plane.width_m, plane.height_m, cell_m=cell,
                                 depth_front_m=opts.depth_front_m, depth_back_m=opts.depth_back_m,
                                 source=pc_source)
+    elif not opts.use_point_cloud:
+        depth = flat_depth(plane.height_m, "point cloud disabled")
+    elif project.cloud is None:
+        depth = flat_depth(plane.height_m, "no point cloud in dataset")
     else:
-        points_wall = None
-        depth = flat_depth(plane.height_m, "point cloud disabled" if not opts.use_point_cloud else "no point cloud in dataset")
+        depth = flat_depth(plane.height_m, "point cloud has no points on this wall")
     if depth.point_count == 0:
         warnings.append(f"surface depth: {depth.source}; trim and recesses may show slight parallax")
     timings["depth_seconds"] = round(time.time() - phase, 1)
     _log(progress, f"Surface depth: {depth.source}")
-
-    # --- candidate photos + occluders -----------------------------------------
-    sel = opts.selection
-    candidates = prefilter_shots(shots, plane, sel)
-    if not candidates:
-        hint = ""
-        if project.frame_report and project.frame_report.get("warnings"):
-            hint = " Note: " + "; ".join(project.frame_report["warnings"])
-        raise RuntimeError("no photos look at this wall from in front of it; check the wall corners "
-                           "or fly oblique passes facing this side." + hint)
-    reach = float(max(((s.center - plane.origin) @ plane.w) for s in candidates)) + 1.0
-    occluders = occluder_points(points_wall, points_world, plane.width_m, plane.height_m,
-                                opts.depth_back_m, reach, pad_m=reach)
-    if len(occluders) > opts.max_occluder_points:
-        rng = np.random.default_rng(0)
-        occluders = occluders[rng.choice(len(occluders), opts.max_occluder_points, replace=False)]
     if len(occluders) == 0:
         warnings.append("no point cloud for occlusion checks; objects in front of the wall may smear onto it")
 

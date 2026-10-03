@@ -10,7 +10,9 @@ from pathlib import Path
 from .cameras import load_reconstruction
 from .georef import resolve_frame
 from .images import image_size
-from .pointcloud import load_geo_mesh_vertices, load_point_cloud
+from .cloud import CloudSource, find_cloud, find_mesh
+
+FRAME_CHECK_POINTS = 6_000_000
 
 
 def safe_extract(zip_path: Path, dest: Path):
@@ -49,9 +51,13 @@ class Project:
     epsg: int | None
     source_frame: str
     missing_images: list
-    points: object = None          # dense cloud (N,3) in the same frame as the shots, or None
-    points_source: str | None = None
+    cloud: CloudSource | None = None   # streamed dense geometry, in the shots' frame
     frame_report: dict | None = None
+    sparse: object = None              # OpenSfM sparse points, moved with the shots
+
+    @property
+    def points_source(self):
+        return self.cloud.src if self.cloud else None
 
 
 def parse_coords(path: Path):
@@ -123,18 +129,22 @@ def load_project(search_dir: Path) -> Project:
         epsg, oe, on = None, 0.0, 0.0
         frame = "opensfm_topocentric"
 
-    points, points_src, kind = load_point_cloud(root, oe, on)
+    cloud = find_cloud(root, oe, on)
+    if frame != "odm_utm_offset" and cloud is not None and cloud.kind != "ply":
+        cloud = None  # LAZ / geo mesh are in the projected frame; poses are not
     report = None
     if frame == "odm_utm_offset":
-        reference, ref_src = (points, points_src) if kind == "laz" else load_geo_mesh_vertices(root)
+        # reference geometry whose frame is certain: the LAZ, else the geo mesh
+        ref_src = cloud if cloud is not None and cloud.kind == "laz" else find_mesh(root)
+        reference = ref_src.sample(FRAME_CHECK_POINTS) if ref_src is not None else None
         report, transform = resolve_frame(usable, sparse, reference, ref_lla, epsg, oe, on, marker)
-        report["reference"] = ref_src
-        if kind == "ply":
-            points = transform(points)  # the PLY was in the poses' original frame
-        elif points is None and reference is not None:
-            # no dense cloud at all: the textured mesh still gives depth and occlusion
-            points, points_src = reference, ref_src
+        report["reference"] = ref_src.src if ref_src is not None else None
+        del reference
+        if cloud is not None and cloud.kind == "ply":
+            cloud.transform = transform  # the PLY was in the poses' original frame
+        if sparse is not None:
+            sparse = transform(sparse)
         print("pose frame: " + json.dumps({k: v for k, v in report.items() if k != "warnings"}), flush=True)
     return Project(root=root, shots=usable, offset_e=oe, offset_n=on, epsg=epsg,
-                   source_frame=frame, missing_images=missing, points=points,
-                   points_source=points_src, frame_report=report)
+                   source_frame=frame, missing_images=missing, cloud=cloud, frame_report=report,
+                   sparse=sparse)

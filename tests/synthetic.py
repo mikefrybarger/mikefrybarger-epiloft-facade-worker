@@ -119,7 +119,7 @@ def write_ply(path: Path, pts: np.ndarray):
     path.write_bytes(header + pts.tobytes())
 
 
-def point_cloud(spacing=0.03, seed=0, post_ring=24, post_step=0.03):
+def point_cloud(spacing=0.03, seed=0, post_ring=24, post_step=0.03, ground=False):
     rng = np.random.default_rng(seed)
     uu, vv = np.meshgrid(np.arange(0, WALL_W, spacing), np.arange(0, WALL_H, spacing))
     wall = world_wall(uu.ravel(), vv.ravel(), rng.normal(0, 0.004, uu.size))
@@ -129,7 +129,13 @@ def point_cloud(spacing=0.03, seed=0, post_ring=24, post_step=0.03):
     post_c = ORIGIN + POST_U * U + POST_W * W
     post = np.stack([post_c[0] + POST_R * np.cos(aa.ravel()), post_c[1] + POST_R * np.sin(aa.ravel()),
                      ORIGIN[2] + zz.ravel()], -1)
-    return np.concatenate([wall, post])
+    parts = [wall, post]
+    if ground:  # lawn in front of the wall and a return wall at the left corner
+        gu, gw = np.meshgrid(np.arange(-1.0, WALL_W + 1.0, 0.05), np.arange(0.1, 5.0, 0.05))
+        parts.append(world_wall(gu.ravel(), np.zeros(gu.size), gw.ravel()))
+        rv, rw = np.meshgrid(np.arange(0, WALL_H, 0.05), np.arange(0.05, 1.5, 0.05))
+        parts.append(world_wall(np.zeros(rv.size), rv.ravel(), rw.ravel()))
+    return np.concatenate(parts)
 
 
 REF_LLA = {"lat": 44.09, "lon": -103.21, "alt": 0.0}  # western SD: ~1.25 deg grid convergence

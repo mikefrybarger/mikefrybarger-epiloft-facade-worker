@@ -244,3 +244,51 @@ def test_topocentric_ply_moves_with_the_poses(tmp_path):
     assert _post_fraction(rgba[..., :3], rgba[..., 3]) < 0.0005
     psnr, _ = _compare(rgba, 0.005)
     assert psnr > 27, psnr
+
+
+def _shift_poses(root, delta):
+    """Simulate a datum / georeferencing error: every pose and sparse point off by delta."""
+    p = root / "opensfm" / "reconstruction.json"
+    recon = json.loads(p.read_text())
+    for shot in recon[0]["shots"].values():
+        R = cv2.Rodrigues(np.array(shot["rotation"], float))[0]
+        c = -R.T @ np.array(shot["translation"]) + delta
+        shot["translation"] = (-R @ c).tolist()
+    for pt in recon[0]["points"].values():
+        pt["coordinates"] = (np.array(pt["coordinates"]) + delta).tolist()
+    p.write_text(json.dumps(recon))
+
+
+def test_local_snap_corrects_pose_offset(tmp_path):
+    """Ground and a return wall make all three directions observable; a lone
+    flat wall can only pin the direction perpendicular to it."""
+    pytest.importorskip("scipy")
+    delta = np.array([0.12, -0.08, 0.05])
+    root = tmp_path / "odm"
+    syn.build_project(root, frame_mode="marker", cloud={"ground": True})
+    _shift_poses(root, delta)
+    sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5)
+    frame = sidecar["wall_to_world"]["pose_frame"]
+    assert frame["constrained_axes"] == 3, frame
+    assert np.allclose(frame["local_snap_m"], -delta, atol=0.01), frame
+    assert frame["local_fit_m"] < 0.02, frame
+    psnr, shift = _compare(rgba, 0.005)
+    assert psnr > 27, psnr
+    assert abs(shift[0]) < 0.5 and abs(shift[1]) < 0.5, shift
+
+
+def test_local_snap_never_invents_unconstrained_motion(tmp_path):
+    """Wall + vertical post, no ground: the wall pins through-wall motion, the
+    post's curved side pins along-wall motion, nothing pins vertical."""
+    pytest.importorskip("scipy")
+    delta = np.array([0.12, -0.08, 0.05])
+    root = tmp_path / "odm"
+    syn.build_project(root, frame_mode="marker")
+    _shift_poses(root, delta)
+    sidecar, _ = _run(root, tmp_path / "out", gsd_mm=5)
+    frame = sidecar["wall_to_world"]["pose_frame"]
+    snap = np.array(frame["local_snap_m"])
+    assert frame["constrained_axes"] == 2, frame
+    assert abs(snap @ syn.W + delta @ syn.W) < 0.01, frame   # through-wall error removed
+    assert abs(snap @ syn.U + delta @ syn.U) < 0.02, frame   # along-wall, via the post
+    assert abs(snap @ syn.V) < 0.005, frame                  # vertical: nothing invented

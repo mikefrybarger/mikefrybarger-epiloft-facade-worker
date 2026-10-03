@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import numpy as np
 
-GOOD_FIT_M = 0.30      # median sparse-to-dense distance that counts as aligned
+GOOD_FIT_M = 0.30      # median sparse-to-dense distance that counts as aligned (site-wide sample)
+LOCAL_GOOD_FIT_M = 0.10  # same, against full-density points at the wall
+MAX_LOCAL_SNAP_M = 0.5
 MAX_SNAP_M = 3.0       # never "fix" a residual larger than this by translation alone
 SPARSE_SAMPLE = 20_000
-TREE_SAMPLE = 2_000_000
+TREE_SAMPLE = 6_000_000
 
 
 def umeyama(src: np.ndarray, dst: np.ndarray):
@@ -164,7 +166,13 @@ def resolve_frame(shots: dict, sparse: np.ndarray | None, dense_offset: np.ndarr
         apply_translation(shots, snap)
     report["snap_m"] = [round(float(v), 4) for v in snap]
     report["fit_m"] = round(best, 4)
-    if best > GOOD_FIT_M:
+    # A thinned site-wide sample has wide gaps between points, which inflates
+    # the fit even when alignment is perfect; judge it against that spacing.
+    self_d, _ = tree.query(dense_offset[rng.choice(len(dense_offset), min(20000, len(dense_offset)),
+                                                   replace=False)], k=2, workers=-1)
+    spacing = float(np.median(self_d[:, 1]))
+    report["reference_spacing_m"] = round(spacing, 4)
+    if best > max(GOOD_FIT_M, 3 * spacing):
         report["warnings"].append(
             f"camera poses only fit the point cloud to {best:.2f} m (median); the facade may be misaligned"
         )
@@ -175,3 +183,78 @@ def resolve_frame(shots: dict, sparse: np.ndarray | None, dense_offset: np.ndarr
             p = sim[0] * p @ sim[1].T + sim[2]
         return p + snap
     return report, transform
+
+
+def _normals(dense: np.ndarray, tree, idx: np.ndarray, k: int = 12) -> np.ndarray:
+    """Unit surface normals at dense[idx] from k-neighbour PCA."""
+    _, nb = tree.query(dense[idx], k=min(k, len(dense)), workers=-1)
+    pts = dense[nb]                                   # (m, k, 3)
+    pts = pts - pts.mean(axis=1, keepdims=True)
+    cov = np.einsum("mki,mkj->mij", pts, pts)
+    _, vecs = np.linalg.eigh(cov)                     # ascending eigenvalues
+    return vecs[:, :, 0]
+
+
+def local_snap(shots: dict, sparse: np.ndarray | None, dense: np.ndarray, plane,
+               reach_m: float = 2.0, iterations: int = 10) -> dict:
+    """Fine translation of the poses onto full-density geometry at one wall.
+
+    Point-to-plane ICP, translation only: each sparse point is pulled along
+    the local surface normal of its match, solved by least squares. A shift
+    is only applied along directions the geometry constrains: a lone flat
+    wall pins the direction through the wall, while ground and a return wall
+    at a corner pin all three. Unconstrained directions are reported, never
+    guessed.
+    """
+    out = {"local_fit_m": None, "local_snap_m": [0.0, 0.0, 0.0], "local_points": 0,
+           "constrained_axes": 0, "warnings": []}
+    if sparse is None or len(sparse) == 0 or dense is None or len(dense) < 1000:
+        return out
+    uvw = plane.to_wall(sparse)
+    near = ((uvw[:, 0] >= -reach_m) & (uvw[:, 0] <= plane.width_m + reach_m)
+            & (uvw[:, 1] >= -reach_m) & (uvw[:, 1] <= plane.height_m + reach_m)
+            & (np.abs(uvw[:, 2]) <= reach_m))
+    pts = sparse[near]
+    out["local_points"] = int(len(pts))
+    if len(pts) < 50:
+        return out
+    from scipy.spatial import cKDTree  # noqa: PLC0415
+
+    tree = cKDTree(dense)
+    start_fit, _ = _fit(pts, tree)
+    snap = np.zeros(3)
+    axes = 0
+    for _ in range(iterations):
+        d, idx = tree.query(pts + snap, k=1, workers=-1)
+        n = _normals(dense, tree, idx)
+        r = np.einsum("mi,mi->m", dense[idx] - (pts + snap), n)
+        mad = np.median(np.abs(r - np.median(r))) * 1.4826
+        keep = (np.abs(r) < max(3 * mad, 0.02)) & (d < max(3 * np.median(d), 0.10))
+        if keep.sum() < 50:
+            break
+        nk, rk = n[keep], r[keep]
+        a = nk.T @ nk
+        b = nk.T @ rk
+        evals, evecs = np.linalg.eigh(a)
+        ok = evals > 0.02 * evals.max()   # directions with real geometric support
+        axes = int(ok.sum())
+        step = evecs[:, ok] @ ((evecs[:, ok].T @ b) / evals[ok])
+        snap = snap + step
+        if np.linalg.norm(step) < 1e-4:
+            break
+    fit, _ = _fit(pts + snap, tree)
+    out["constrained_axes"] = axes
+    if np.linalg.norm(snap) > MAX_LOCAL_SNAP_M:
+        out["warnings"].append(f"local alignment wanted a {np.linalg.norm(snap):.2f} m shift; not applied")
+        snap, fit = np.zeros(3), start_fit
+    elif fit < start_fit - 1e-4:
+        apply_translation(shots, snap)
+    else:
+        snap, fit = np.zeros(3), start_fit
+    out["local_snap_m"] = [round(float(v), 4) for v in snap]
+    out["local_fit_m"] = round(fit, 4)
+    if fit > LOCAL_GOOD_FIT_M:
+        out["warnings"].append(
+            f"camera poses fit the geometry at this wall to {fit:.2f} m (median); the facade may be misaligned"
+        )
+    return out

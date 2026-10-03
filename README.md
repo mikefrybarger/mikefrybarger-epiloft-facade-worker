@@ -36,7 +36,12 @@ certain, in this order:
 2. `odm_texturing/odm_textured_model_geo.obj` (offset frame, the mesh Studio shows)
 
 It keeps whichever hypothesis fits the reconstruction's sparse points
-better, then applies a small translation-only snap. The decision, the fit
+better (using a uniform 6-million-point sample of the site), then applies a
+small translation-only snap. Once the wall is known, a second, fine snap runs
+against full-density geometry at that wall: point-to-plane ICP, translation
+only, applied just along directions the geometry constrains (a lone flat
+wall pins only the through-wall direction; ground and a corner pin all
+three). `local_fit_m`, `local_snap_m` and `constrained_axes` are reported. The decision, the fit
 of both hypotheses, the rotation and the snap are recorded in
 `facade.json` under `wall_to_world.pose_frame`. A fit worse than 0.30 m,
 or no geometry to check against, produces a warning.
@@ -153,6 +158,16 @@ The worker can only use photos that face the wall. For each elevation:
   front of the wall, so something sees behind them.
 - Nadir mapping photos are ignored for facades; they still help the
   reconstruction.
+
+## Memory
+
+Dense geometry is streamed, never loaded whole: LAZ through laspy's chunk
+iterator (multi-threaded decompression), binary PLY through a memory map,
+OBJ line by line (`facade/cloud.py`). The worker keeps a 6 M point site-wide
+sample for the frame check, every point on the wall surface, and a capped
+8 M point sample of anything between the wall and the cameras. A full job
+against a 40 M point LAZ peaked at **0.8 GB**; peak memory no longer grows
+with site size.
 
 ## Performance
 
