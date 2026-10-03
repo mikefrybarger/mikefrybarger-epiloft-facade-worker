@@ -1,13 +1,16 @@
 """Locate the pieces of an extracted ODM project (same ZIP the splat worker takes)."""
 from __future__ import annotations
 
+import json
 import re
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from .cameras import load_reconstruction
+from .georef import resolve_frame
 from .images import image_size
+from .pointcloud import load_geo_mesh_vertices, load_point_cloud
 
 
 def safe_extract(zip_path: Path, dest: Path):
@@ -46,6 +49,9 @@ class Project:
     epsg: int | None
     source_frame: str
     missing_images: list
+    points: object = None          # dense cloud (N,3) in the same frame as the shots, or None
+    points_source: str | None = None
+    frame_report: dict | None = None
 
 
 def parse_coords(path: Path):
@@ -66,7 +72,7 @@ def parse_coords(path: Path):
 
 def load_project(search_dir: Path) -> Project:
     root = find_project_root(search_dir)
-    shots = load_reconstruction(root / "opensfm" / "reconstruction.json")
+    shots, sparse = load_reconstruction(root / "opensfm" / "reconstruction.json")
 
     index = {}
     for p in search_dir.rglob("*"):
@@ -96,13 +102,39 @@ def load_project(search_dir: Path) -> Project:
             raise RuntimeError(f"{base} aspect {w}x{h} does not match camera {cw}x{ch}")
         shot.image_w, shot.image_h = w, h
 
+    usable = {k: s for k, s in shots.items() if s.image_path is not None}
+
     coords = root / "odm_georeferencing" / "coords.txt"
-    if (root / "opensfm" / "reconstruction.topocentric.json").is_file() and coords.is_file():
+    marker = (root / "opensfm" / "reconstruction.topocentric.json").is_file()
+    ref_lla = None
+    ref_path = root / "opensfm" / "reference_lla.json"
+    if ref_path.is_file():
+        try:
+            ref = json.loads(ref_path.read_text())
+            ref_lla = {"lat": float(ref["latitude"]), "lon": float(ref["longitude"]),
+                       "alt": float(ref.get("altitude", 0.0))}
+        except (ValueError, KeyError, TypeError) as exc:
+            print(f"could not read reference_lla.json: {exc}", flush=True)
+
+    if coords.is_file():
         epsg, oe, on = parse_coords(coords)
         frame = "odm_utm_offset"
     else:
         epsg, oe, on = None, 0.0, 0.0
         frame = "opensfm_topocentric"
-    usable = {k: s for k, s in shots.items() if s.image_path is not None}
+
+    points, points_src, kind = load_point_cloud(root, oe, on)
+    report = None
+    if frame == "odm_utm_offset":
+        reference, ref_src = (points, points_src) if kind == "laz" else load_geo_mesh_vertices(root)
+        report, transform = resolve_frame(usable, sparse, reference, ref_lla, epsg, oe, on, marker)
+        report["reference"] = ref_src
+        if kind == "ply":
+            points = transform(points)  # the PLY was in the poses' original frame
+        elif points is None and reference is not None:
+            # no dense cloud at all: the textured mesh still gives depth and occlusion
+            points, points_src = reference, ref_src
+        print("pose frame: " + json.dumps({k: v for k, v in report.items() if k != "warnings"}), flush=True)
     return Project(root=root, shots=usable, offset_e=oe, offset_n=on, epsg=epsg,
-                   source_frame=frame, missing_images=missing)
+                   source_frame=frame, missing_images=missing, points=points,
+                   points_source=points_src, frame_report=report)

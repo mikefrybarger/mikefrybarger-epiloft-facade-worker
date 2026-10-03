@@ -132,7 +132,50 @@ def point_cloud(spacing=0.03, seed=0, post_ring=24, post_step=0.03):
     return np.concatenate([wall, post])
 
 
-def build_project(root: Path, *, gains=None, with_cloud=True, cloud=None):
+REF_LLA = {"lat": 44.09, "lon": -103.21, "alt": 0.0}  # western SD: ~1.25 deg grid convergence
+
+
+def write_laz(path: Path, pts_offset: np.ndarray):
+    import laspy  # noqa: PLC0415
+
+    header = laspy.LasHeader(point_format=3, version="1.2")
+    header.scales = [0.001, 0.001, 0.001]
+    header.offsets = [OFFSET_E, OFFSET_N, 0.0]
+    las = laspy.LasData(header)
+    las.x, las.y, las.z = pts_offset[:, 0] + OFFSET_E, pts_offset[:, 1] + OFFSET_N, pts_offset[:, 2]
+    las.write(str(path))
+
+
+def offset_to_topocentric_fn():
+    """Exact offset-frame -> OpenSfM topocentric map (pyproj), for test data."""
+    from pyproj import Transformer  # noqa: PLC0415
+
+    to_ll = Transformer.from_crs("EPSG:32613", "EPSG:4326", always_xy=True)
+    to_topo = Transformer.from_pipeline(
+        "+proj=pipeline +step +proj=unitconvert +xy_in=deg +xy_out=rad "
+        "+step +proj=cart +ellps=WGS84 "
+        f"+step +proj=topocentric +ellps=WGS84 +lat_0={REF_LLA['lat']} +lon_0={REF_LLA['lon']} +h_0={REF_LLA['alt']}"
+    )
+
+    def fn(p):
+        p = np.atleast_2d(p)
+        lon, lat = to_ll.transform(p[:, 0] + OFFSET_E, p[:, 1] + OFFSET_N)
+        x, y, z = to_topo.transform(lon, lat, p[:, 2])
+        return np.stack([x, y, z], -1)
+    return fn
+
+
+def write_geo_obj(path: Path, pts_offset: np.ndarray):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"v {x:.4f} {y:.4f} {z:.4f}" for x, y, z in pts_offset]
+    path.write_text("mtllib odm_textured_model_geo.mtl\n" + "\n".join(lines) + "\nf 1 2 3\n")
+
+
+def build_project(root: Path, *, gains=None, with_cloud=True, cloud=None, frame_mode="marker",
+                  geo_mesh=False, topo_ply=False):
+    """frame_mode: "marker" (offset poses + topocentric marker file, like ODM),
+    "nomarker" (offset poses, no marker, LAZ only), "topocentric" (poses in
+    OpenSfM's local ENU frame, no marker, LAZ only: the Lightning all.zip case)."""
     root = Path(root)
     (root / "opensfm").mkdir(parents=True, exist_ok=True)
     (root / "images").mkdir(exist_ok=True)
@@ -148,14 +191,41 @@ def build_project(root: Path, *, gains=None, with_cloud=True, cloud=None):
         rvec, _ = cv2.Rodrigues(R)
         shots[name] = {"camera": "synthetic", "rotation": rvec.ravel().tolist(),
                        "translation": (-R @ c).tolist()}
-    recon = [{"cameras": {"synthetic": CAMERA}, "shots": shots, "points": {}}]
+    dense = point_cloud(**(cloud or {}))
+    sparse = dense[rng.choice(len(dense), 3000, replace=False)] + rng.normal(0, 0.01, (3000, 3))
+    if frame_mode == "topocentric":
+        to_topo = offset_to_topocentric_fn()
+        # local rotation of the frame change, from the exact map
+        c0 = world_wall(WALL_W / 2, WALL_H / 2)
+        jac = np.stack([(to_topo(c0 + e) - to_topo(c0 - e))[0] / 2 for e in np.eye(3)], -1)
+        u, _, vt = np.linalg.svd(jac)
+        r_topo = u @ vt
+        for (name, c, target) in cams:
+            R = look_at(c, target) @ r_topo.T
+            ct = to_topo(c)[0]
+            rvec, _ = cv2.Rodrigues(R)
+            shots[name] = {"camera": "synthetic", "rotation": rvec.ravel().tolist(),
+                           "translation": (-R @ ct).tolist()}
+        sparse = to_topo(sparse)
+        (root / "opensfm" / "reference_lla.json").write_text(json.dumps(
+            {"latitude": REF_LLA["lat"], "longitude": REF_LLA["lon"], "altitude": REF_LLA["alt"]}))
+    points = {str(i): {"coordinates": p.tolist()} for i, p in enumerate(sparse)}
+    recon = [{"cameras": {"synthetic": CAMERA}, "shots": shots, "points": points}]
     (root / "opensfm" / "reconstruction.json").write_text(json.dumps(recon))
-    (root / "opensfm" / "reconstruction.topocentric.json").write_text("[]")
+    if frame_mode == "marker":
+        (root / "opensfm" / "reconstruction.topocentric.json").write_text("[]")
     (root / "opensfm" / "image_list.txt").write_text("\n".join(f"images/{n}" for n, *_ in cams))
     (root / "odm_georeferencing" / "coords.txt").write_text(f"WGS84 UTM 13N\n{OFFSET_E:.0f} {OFFSET_N:.0f}\n")
-    if with_cloud:
+    if with_cloud and frame_mode == "marker":
         (root / "odm_filterpoints").mkdir(exist_ok=True)
-        write_ply(root / "odm_filterpoints" / "point_cloud.ply", point_cloud(**(cloud or {})))
+        write_ply(root / "odm_filterpoints" / "point_cloud.ply", dense)
+    elif with_cloud:
+        write_laz(root / "odm_georeferencing" / "odm_georeferenced_model.laz", dense)
+    if topo_ply:  # ODM's filterpoints PLY lives in the reconstruction's own frame
+        (root / "odm_filterpoints").mkdir(exist_ok=True)
+        write_ply(root / "odm_filterpoints" / "point_cloud.ply", offset_to_topocentric_fn()(dense))
+    if geo_mesh:
+        write_geo_obj(root / "odm_texturing" / "odm_textured_model_geo.obj", dense[::4])
     return {name: g for (name, *_), g in zip(cams, gains)}
 
 

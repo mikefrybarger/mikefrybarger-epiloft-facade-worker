@@ -83,26 +83,63 @@ def read_laz_xyz(path: Path, offset_e: float, offset_n: float) -> np.ndarray:
     return np.stack([np.asarray(las.x) - offset_e, np.asarray(las.y) - offset_n, np.asarray(las.z)], axis=-1)
 
 
-def find_point_cloud(project_root: Path):
-    for rel in PLY_CANDIDATES:
-        p = project_root / rel
+def find_point_cloud(project_root: Path, prefer_laz: bool = True):
+    """The georeferenced LAZ comes first: its frame (absolute UTM) is never in
+    doubt, while the PLY is in whatever frame the reconstruction was in."""
+    ply = [(project_root / rel, "ply") for rel in PLY_CANDIDATES]
+    laz = [(project_root / rel, "laz") for rel in LAZ_CANDIDATES]
+    for p, kind in (laz + ply if prefer_laz else ply + laz):
         if p.is_file():
-            return p, "ply"
-    for rel in LAZ_CANDIDATES:
-        p = project_root / rel
-        if p.is_file():
-            return p, "laz"
+            return p, kind
     return None, None
 
 
-def load_point_cloud(project_root: Path, offset_e=0.0, offset_n=0.0):
-    """Returns (points (N,3) in the OpenSfM frame, source description) or (None, None)."""
-    path, kind = find_point_cloud(project_root)
+def load_point_cloud(project_root: Path, offset_e=0.0, offset_n=0.0, prefer_laz: bool = True):
+    """Returns (points (N,3), source path, kind) or (None, None, None).
+
+    LAZ comes back in the offset frame; PLY comes back as stored.
+    """
+    path, kind = find_point_cloud(project_root, prefer_laz)
     if path is None:
-        return None, None
+        return None, None, None
     if kind == "ply":
         pts = read_ply_xyz(path)
     else:
         pts = read_laz_xyz(path, offset_e, offset_n)
     pts = pts[np.all(np.isfinite(pts), axis=1)]
-    return pts, str(path.relative_to(project_root))
+    return pts, str(path.relative_to(project_root)), kind
+
+
+GEO_MESH_CANDIDATES = (
+    "odm_texturing/odm_textured_model_geo.obj",
+    "odm_texturing_25d/odm_textured_model_geo.obj",
+)
+
+
+def read_obj_vertices(path: Path, max_vertices: int = 5_000_000) -> np.ndarray:
+    """Vertex positions from a Wavefront OBJ (``v x y z`` lines only)."""
+    out = []
+    with open(path, "rb") as f:
+        for line in f:
+            if line.startswith(b"v "):
+                parts = line.split()
+                out.append((float(parts[1]), float(parts[2]), float(parts[3])))
+                if len(out) >= max_vertices:
+                    break
+    return np.asarray(out, dtype=np.float64).reshape(-1, 3)
+
+
+def load_geo_mesh_vertices(project_root: Path):
+    """ODM's georeferenced textured mesh, already in the offset frame.
+
+    This is the geometry Studio displays, so it is the best thing to check the
+    pose frame against when the archive has no georeferenced LAZ.
+    """
+    for rel in GEO_MESH_CANDIDATES:
+        p = project_root / rel
+        if p.is_file():
+            v = read_obj_vertices(p)
+            v = v[np.all(np.isfinite(v), axis=1)]
+            if len(v):
+                return v, rel
+    return None, None

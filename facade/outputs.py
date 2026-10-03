@@ -103,6 +103,7 @@ def build_sidecar(result: dict, plane, frame_ctx, project, extra: dict) -> dict:
             "source_frame": project.source_frame,
             "utm": ({"epsg": project.epsg, "offset_e": project.offset_e, "offset_n": project.offset_n}
                     if project.source_frame == "odm_utm_offset" else None),
+            "pose_frame": project.frame_report,
         },
         "plane": plane.describe(frame_ctx),
         "depth": result["depth"],

@@ -3,15 +3,14 @@
 FROM python:3.11-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    OMP_NUM_THREADS=0
+    PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m pip install -r /tmp/requirements.txt \
-    && python3 -c "import cv2, numpy, tifffile, laspy, pyvips; print('deps ok, vips', pyvips.version(0), pyvips.version(1))"
+    && python3 -c "import cv2, numpy, tifffile, laspy, pyvips, scipy, pyproj; print('deps ok, vips', pyvips.version(0), pyvips.version(1))"
 
 WORKDIR /worker
 COPY facade /worker/facade

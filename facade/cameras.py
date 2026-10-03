@@ -152,7 +152,7 @@ class Shot:
 
 
 def load_reconstruction(path: Path):
-    """Parse the first reconstruction in reconstruction.json into Shot objects."""
+    """First reconstruction in reconstruction.json -> (shots, sparse points (N,3) or None)."""
     data = json.loads(Path(path).read_text())
     if isinstance(data, dict):
         data = [data]
@@ -174,6 +174,9 @@ def load_reconstruction(path: Path):
     if not shots:
         raise RuntimeError("reconstruction.json contains no shots")
     if len(data) > 1:
+        others = sum(len(r.get("shots") or {}) for r in data[1:])
         print(f"note: reconstruction.json has {len(data)} partial reconstructions; "
-              f"using the first ({len(shots)} shots)", flush=True)
-    return shots
+              f"using the first ({len(shots)} shots, {others} shots in the others)", flush=True)
+    pts = [p.get("coordinates") for p in (recon.get("points") or {}).values()]
+    pts = np.asarray([p for p in pts if p and len(p) == 3], dtype=np.float64)
+    return shots, (pts if len(pts) else None)

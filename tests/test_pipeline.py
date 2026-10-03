@@ -188,3 +188,59 @@ def test_sparse_point_cloud_still_blocks_post(tmp_path):
     syn.build_project(root, cloud={"spacing": 0.08, "post_ring": 8, "post_step": 0.08})
     _, rgba = _run(root, tmp_path / "out", gsd_mm=5)
     assert _post_fraction(rgba[..., :3], rgba[..., 3]) < 0.0005
+
+
+@pytest.mark.parametrize("mode", ["nomarker", "topocentric"])
+def test_pose_frame_detected_from_data(tmp_path, mode):
+    """The Lightning all.zip case: no reconstruction.topocentric.json marker.
+
+    Topocentric poses are rotated ~1.25 deg and shifted relative to the
+    offset frame here, so guessing wrong would wreck the comparison."""
+    pytest.importorskip("laspy")
+    pytest.importorskip("pyproj")
+    root = tmp_path / "odm"
+    syn.build_project(root, frame_mode=mode)
+    sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5)
+    frame = sidecar["wall_to_world"]["pose_frame"]
+    expected = "offset" if mode == "nomarker" else "topocentric"
+    assert frame["method"].startswith(expected), frame
+    assert frame["fit_m"] < 0.05, frame
+    psnr, shift = _compare(rgba, 0.005)
+    assert psnr > 27, psnr
+    assert abs(shift[0]) < 0.5 and abs(shift[1]) < 0.5, shift
+    assert _post_fraction(rgba[..., :3], rgba[..., 3]) < 0.0005
+    assert not any("frame" in w for w in sidecar["warnings"]), sidecar["warnings"]
+
+
+def test_topocentric_checked_against_textured_mesh(tmp_path):
+    """No LAZ, but ODM's georeferenced textured mesh is in the archive."""
+    pytest.importorskip("pyproj")
+    root = tmp_path / "odm"
+    syn.build_project(root, frame_mode="topocentric", with_cloud=False, geo_mesh=True)
+    sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5)
+    frame = sidecar["wall_to_world"]["pose_frame"]
+    assert frame["method"].startswith("topocentric") and frame["reference"].endswith(".obj"), frame
+    psnr, _ = _compare(rgba, 0.005)
+    assert psnr > 27, psnr
+
+
+def test_unverifiable_frame_is_explained(tmp_path):
+    """Nothing to check against and the guess is wrong: the error says why."""
+    root = tmp_path / "odm"
+    syn.build_project(root, frame_mode="topocentric", with_cloud=False)
+    with pytest.raises(RuntimeError, match="could not verify the camera frame"):
+        _run(root, tmp_path / "out", gsd_mm=10)
+
+
+def test_topocentric_ply_moves_with_the_poses(tmp_path):
+    """PLY in the poses' original frame + textured mesh as the reference: the
+    PLY must get the same frame change, or occlusion and depth miss the wall."""
+    pytest.importorskip("pyproj")
+    root = tmp_path / "odm"
+    syn.build_project(root, frame_mode="topocentric", with_cloud=False, geo_mesh=True, topo_ply=True)
+    sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5)
+    assert sidecar["depth"]["source"].endswith("point_cloud.ply")
+    assert abs(sidecar["depth"]["offset_median_m"]) < 0.02, sidecar["depth"]
+    assert _post_fraction(rgba[..., :3], rgba[..., 3]) < 0.0005
+    psnr, _ = _compare(rgba, 0.005)
+    assert psnr > 27, psnr

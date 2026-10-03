@@ -6,3 +6,5 @@ tifffile>=2024.2.12
 pillow>=10
 laspy[lazrs]>=2.5,<3
 pyvips[binary]>=2.2,<4
+scipy>=1.11,<2
+pyproj>=3.6,<4

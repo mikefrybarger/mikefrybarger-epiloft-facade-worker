@@ -20,6 +20,31 @@ this one is **CPU only**.
 | 5 Blend | Per-photo exposure gains are solved from overlaps, then a Laplacian-pyramid blend hides the seams without ghosting fine detail. Output is built in tiles, so wall size is bounded by disk, not RAM. | `facade/selection.py`, `facade/blend.py`, `facade/pipeline.py` |
 | 6 Outputs | Tiled BigTIFF, sidecar JSON, JPEG preview, optional deep-zoom tiles. | `facade/outputs.py` |
 
+## Which frame are the camera poses in?
+
+ODM writes `opensfm/reconstruction.json` either in the georeferenced offset
+frame (UTM minus `coords.txt`) or in OpenSfM's local topocentric frame, and
+archives such as WebODM Lightning's `all.zip` do not always include the
+`reconstruction.topocentric.json` marker that tells them apart. Guessing
+wrong is not small: grid convergence alone rotates a site in western South
+Dakota by about 1.25 degrees.
+
+So the worker tests both against georeferenced geometry whose frame is
+certain, in this order:
+
+1. `odm_georeferencing/odm_georeferenced_model.laz` (absolute UTM)
+2. `odm_texturing/odm_textured_model_geo.obj` (offset frame, the mesh Studio shows)
+
+It keeps whichever hypothesis fits the reconstruction's sparse points
+better, then applies a small translation-only snap. The decision, the fit
+of both hypotheses, the rotation and the snap are recorded in
+`facade.json` under `wall_to_world.pose_frame`. A fit worse than 0.30 m,
+or no geometry to check against, produces a warning.
+
+Dense geometry for depth and occlusion comes from the LAZ, then the
+filterpoints PLY (moved with the poses if they were topocentric), then the
+textured mesh vertices.
+
 ## RunPod input
 
 ```json
@@ -155,16 +180,18 @@ check the output pixel for pixel:
 - exposure steps of 0.75x / 1.25x are levelled
 - inside-out corners flip instead of mirroring; mesh and OpenSfM frames agree
 - a sparse point cloud still blocks the post (regression from 20 MP testing)
+- poses in the topocentric frame with no marker file (the Lightning case) are
+  detected against the LAZ or the textured mesh and land sub-pixel; a PLY in
+  the original frame moves with them; an unverifiable frame is explained
 - LAZ point clouds, deep-zoom tiles, the RunPod handler with signed URL upload and refresh
 
 ## Before the first customer job
 
 These depend on real ODM output and are not covered by synthetic tests:
 
-1. **Point cloud frame.** The worker assumes `odm_filterpoints/point_cloud.ply`
-   is in the same offset frame as `reconstruction.json` (it is in current ODM).
-   If a real run's depth `offset_median_m` in the sidecar is far from 0 for a
-   well-picked wall, check this first.
+1. **Pose frame.** Check `wall_to_world.pose_frame.fit_m` in the sidecar of
+   the first real job; it should be a few centimetres. If a well-picked wall
+   has a depth `offset_median_m` far from 0, look here first.
 2. **Mesh origin.** Confirm Studio's `mesh_origin` matches the one the splat
    alignment uses; a mismatch shifts the wall in the photos.
 3. **Tape check.** Run one wall locally and compare a door width and a window

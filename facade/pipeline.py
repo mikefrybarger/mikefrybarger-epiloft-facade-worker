@@ -21,7 +21,6 @@ from .blend import multiband_blend
 from .depth import build_depth_map, flat_depth
 from .geometry import OrthoGrid, WallPlane
 from .images import ImageCache, read_image
-from .pointcloud import load_point_cloud
 from .selection import SelectionConfig, mode_filter, prefilter_shots, score_views, solve_gains
 from .visibility import VisibilityConfig, ZBuffer, auto_downscale, occluder_points
 
@@ -66,6 +65,8 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
     t0 = time.time()
     timings = {}
     warnings = list(plane.notes)
+    if project.frame_report:
+        warnings.extend(project.frame_report.get("warnings", []))
     shots = list(project.shots.values())
     if not shots:
         raise RuntimeError("no photos with solved poses were found in the dataset")
@@ -80,8 +81,8 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
     phase = time.time()
     points_world, pc_source = (None, None)
     point_spacing = 0.05  # fallback when the cloud does not cover the wall
-    if opts.use_point_cloud:
-        points_world, pc_source = load_point_cloud(project.root, project.offset_e, project.offset_n)
+    if opts.use_point_cloud and project.points is not None:
+        points_world, pc_source = project.points, project.points_source
     if points_world is not None:
         points_wall = plane.to_wall(points_world)
         near = ((points_wall[:, 0] >= 0) & (points_wall[:, 0] < plane.width_m)
@@ -111,8 +112,11 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
     sel = opts.selection
     candidates = prefilter_shots(shots, plane, sel)
     if not candidates:
+        hint = ""
+        if project.frame_report and project.frame_report.get("warnings"):
+            hint = " Note: " + "; ".join(project.frame_report["warnings"])
         raise RuntimeError("no photos look at this wall from in front of it; check the wall corners "
-                           "or fly oblique passes facing this side")
+                           "or fly oblique passes facing this side." + hint)
     reach = float(max(((s.center - plane.origin) @ plane.w) for s in candidates)) + 1.0
     occluders = occluder_points(points_wall, points_world, plane.width_m, plane.height_m,
                                 opts.depth_back_m, reach, pad_m=reach)
