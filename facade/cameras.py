@@ -48,6 +48,46 @@ class Camera:
     def _p(self, key, default=0.0):
         return self.params.get(key, default)
 
+    def valid_angle(self, image_w: int, image_h: int) -> float:
+        """Largest ray angle (radians off the optical axis) this lens model can
+        project faithfully into this image.
+
+        Polynomial lens models are only fitted inside the photo. Past that they
+        bend back on themselves: for one real DJI M4E calibration the model
+        folds at 53 deg off-axis and sends rays at 63.5 deg exactly onto the
+        image centre, so wall points far outside the photo were "seen" in it.
+        Valid = up to just past the image corners, and never past the fold.
+        """
+        key = (image_w, image_h)
+        cache = self.__dict__.setdefault("_valid_cache", {})
+        if key in cache:
+            return cache[key]
+        size = max(image_w, image_h)
+        corner = float(np.hypot(image_w / 2.0, image_h / 2.0) / size)
+        cx, cy = self._p("c_x"), self._p("c_y")
+        angles = np.radians(np.linspace(0.0, 179.0, 17901))
+        best = 0.0
+        np_err = np.seterr(invalid="ignore", over="ignore")
+        for phi in np.radians(np.arange(0.0, 360.0, 15.0)):     # all directions
+            dx, dy = np.cos(phi), np.sin(phi)
+            xc = np.sin(angles) * dx
+            yc = np.sin(angles) * dy
+            zc = np.cos(angles)
+            nx, ny = self.project_normalized(xc, yc, zc, clip=False)
+            rr = np.hypot(nx - cx, ny - cy)
+            rr = np.where(np.isfinite(rr), rr, np.inf)
+            grow = np.diff(rr) > 0
+            fold = np.argmin(grow) if not grow.all() else len(rr) - 1   # first non-increase
+            limit = fold
+            past = np.flatnonzero(rr[:fold + 1] > corner * 1.08)
+            if len(past):
+                limit = min(limit, past[0])
+            best = max(best, float(angles[max(limit, 1)]))
+        np.seterr(**np_err)
+        best = min(best, np.radians(179.0))
+        cache[key] = best
+        return best
+
     def focal_px(self, image_w: int, image_h: int) -> float:
         """Approximate focal length in pixels at the given image size."""
         size = max(image_w, image_h)
@@ -57,13 +97,19 @@ class Camera:
             f = 0.5 * (self._p("focal_x", self._p("focal")) + self._p("focal_y", self._p("focal")))
         return f * size
 
-    def project_normalized(self, xc: np.ndarray, yc: np.ndarray, zc: np.ndarray):
+    def project_normalized(self, xc: np.ndarray, yc: np.ndarray, zc: np.ndarray,
+                           clip: bool = True, max_angle: float | None = None):
         """Camera-frame points -> OpenSfM normalized image coords (nx, ny).
 
-        Points with zc <= 0 return NaN.
+        Points with zc <= 0 return NaN, and so do points further off-axis than
+        max_angle (the lens model's valid range) when clip is set.
         """
         with np.errstate(divide="ignore", invalid="ignore"):
             behind = zc <= 1e-9
+            if clip and max_angle is not None and self.model not in ("fisheye", "fisheye_opencv"):
+                behind = behind | (np.arctan2(np.hypot(xc, yc), zc) > max_angle)
+            elif clip and max_angle is not None:
+                behind = np.arctan2(np.hypot(xc, yc), zc) > max_angle
             m = self.model
             if m in ("fisheye", "fisheye_opencv"):
                 r = np.hypot(xc, yc)
@@ -141,8 +187,8 @@ class Shot:
         depth is the camera-frame Z. Points behind the camera get NaN pixels.
         """
         xc, yc, zc = self.to_camera(points)
-        nx, ny = self.camera.project_normalized(xc, yc, zc)
         w, h = self.size()
+        nx, ny = self.camera.project_normalized(xc, yc, zc, max_angle=self.camera.valid_angle(w, h))
         size = max(w, h)
         return nx * size + (w / 2.0 - 0.5), ny * size + (h / 2.0 - 0.5), zc
 

@@ -126,3 +126,26 @@ def test_depth_map_with_holes_stays_in_band():
     # the window is filled from its surroundings, not invented
     win = d.sample(np.array([2.5]), np.array([1.75]))[0]
     assert abs(win - 0.2) < 0.02
+
+
+def test_m4e_lens_model_never_folds_back_into_the_image():
+    """Real DJI M4E calibration: the polynomial folds at 53 deg and maps 63.5 deg
+    onto the image centre. Only rays inside the photo may project."""
+    raw = {"projection_type": "brown", "width": 5280, "height": 3956,
+           "focal_x": 0.7052558642285107, "focal_y": 0.7052558642285107,
+           "c_x": 0.004969223516840049, "c_y": -0.00470324524625981, "k1": -0.10341031555259611,
+           "k2": -0.01531662859893411, "p1": 2.6876150908751606e-06,
+           "p2": -0.00020501113013549115, "k3": -0.005277757045775089}
+    cam = Camera.from_json("m4e", raw)
+    shot = Shot("s", cam, np.eye(3), np.zeros(3), None, 5280, 3956)
+    assert 45 < np.degrees(cam.valid_angle(5280, 3956)) < 52
+    ang = np.radians(np.linspace(0, 89, 400))
+    for phi in np.radians([0, 37, 90, 145, 210, 300]):
+        pts = np.stack([np.sin(ang) * np.cos(phi), np.sin(ang) * np.sin(phi), np.cos(ang)], -1)
+        px, py, _ = shot.project(pts)
+        ok = np.isfinite(px)
+        pp_x = 2639.5 + raw["c_x"] * 5280                 # principal point, pixels
+        pp_y = 1977.5 + raw["c_y"] * 5280
+        r = np.hypot(px[ok] - pp_x, py[ok] - pp_y)
+        assert np.all(np.diff(r) > 0)                     # strictly outward: no fold
+        assert not np.any(ok & (np.degrees(ang) > 52))    # nothing from outside the field

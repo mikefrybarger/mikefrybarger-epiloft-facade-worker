@@ -91,6 +91,7 @@ class WallPlane:
     width_m: float
     height_m: float
     notes: list = field(default_factory=list)
+    view_from: np.ndarray | None = None   # Studio camera position when the wall was picked
 
     @classmethod
     def from_corners(cls, bottom_left, bottom_right, top_left):
@@ -128,10 +129,23 @@ class WallPlane:
         votes_minus = int(np.sum((side < 0) & (facing > 0.3)))
         if votes_plus >= votes_minus:
             return False
+        self.flip("plane flipped so its normal faces the cameras")
+        return True
+
+    def flip(self, note: str):
+        """Turn the plane around: W points the other way, U too (so the image
+        still reads left to right from the new outside), origin moves to the
+        other bottom corner."""
         self.origin = self.origin + self.width_m * self.u
         self.u = -self.u
         self.w = -self.w
-        self.notes.append("plane flipped so its normal faces the cameras")
+        self.notes.append(note)
+
+    def orient_toward(self, point) -> bool:
+        """Make W point at `point` (e.g. where the user stood in Studio). True if flipped."""
+        if (np.asarray(point, dtype=np.float64) - self.origin) @ self.w >= 0:
+            return False
+        self.flip("plane turned to face the side it was picked from in Studio")
         return True
 
     def to_wall(self, points: np.ndarray) -> np.ndarray:

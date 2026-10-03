@@ -136,7 +136,8 @@ class CloudSource:
         return kept.result()
 
     def wall_region(self, plane, *, depth_front_m: float, depth_back_m: float, reach_m: float,
-                    max_surface: int = 40_000_000, max_occluders: int = 8_000_000, seed: int = 0):
+                    max_surface: int = 40_000_000, max_occluders: int = 8_000_000, seed: int = 0,
+                    two_sided: bool = False):
         """(surface, occluders) points in the shots' frame.
 
         surface: everything within the wall rectangle and the depth search
@@ -153,7 +154,8 @@ class CloudSource:
             u, v, w = uvw[:, 0], uvw[:, 1], uvw[:, 2]
             on_wall = ((u >= -0.5) & (u <= wm + 0.5) & (v >= -0.5) & (v <= hm + 0.5)
                        & (w >= -depth_back_m - 0.1) & (w <= depth_front_m + 0.1))
-            between = (~on_wall & (w >= -depth_back_m) & (w <= reach_m)
+            w_min = -reach_m if two_sided else -depth_back_m
+            between = (~on_wall & (w >= w_min) & (w <= reach_m)
                        & (u >= -reach_m) & (u <= wm + reach_m) & (v >= -reach_m) & (v <= hm + reach_m))
             surface.add(c[on_wall])
             occ.add(c[between])

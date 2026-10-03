@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import dataclasses
+import json
 import math
 import time
 from dataclasses import asdict, dataclass, field
@@ -24,6 +26,7 @@ from .georef import local_snap
 from .geometry import OrthoGrid, WallPlane
 from .images import ImageCache, read_image
 from .selection import SelectionConfig, mode_filter, prefilter_shots, score_views, solve_gains
+from .side import choose_side
 from .visibility import VisibilityConfig, ZBuffer, auto_downscale
 
 
@@ -80,31 +83,29 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
     if not shots:
         raise RuntimeError("no photos with solved poses were found in the dataset")
 
-    # --- orient the plane toward the photographer ---------------------------
-    centers = np.array([s.center for s in shots])
-    axes = np.array([s.optical_axis for s in shots])
-    if plane.face_cameras(centers, axes):
-        warnings.append("wall normal was flipped to face the cameras; image reads left to right from outside")
-
-    # --- candidate photos (decides how far out the cloud needs reading) ------
+    # --- which face of the wall is the outside? ------------------------------
     sel = opts.selection
-    candidates = prefilter_shots(shots, plane, sel)
-    if not candidates:
+    side_report = None
+    if plane.view_from is not None:
+        side_report = {"method": "view_from", "flipped": plane.orient_toward(plane.view_from)}
+    probe_back = dataclasses.replace(plane, w=-plane.w, notes=[])
+    reachable = prefilter_shots(shots, plane, sel)
+    if plane.view_from is None:
+        reachable += prefilter_shots(shots, probe_back, sel)
+    if not reachable:
         hint = ""
         if project.frame_report and project.frame_report.get("warnings"):
             hint = " Note: " + "; ".join(project.frame_report["warnings"])
-        raise RuntimeError("no photos look at this wall from in front of it; check the wall corners "
-                           "or fly oblique passes facing this side." + hint)
-    reach = float(max(((s.center - plane.origin) @ plane.w) for s in candidates)) + 1.0
+        raise RuntimeError("no photos look at this wall from either side; check the wall corners." + hint)
 
     # --- self-check: does this worker's camera code reproduce OpenSfM? -------
     diagnostics = {"cameras": {}}
-    for s in candidates:
+    for s in reachable:
         cam = s.camera
         if cam.id not in diagnostics["cameras"]:
             diagnostics["cameras"][cam.id] = {"raw": cam.raw, "image_size_seen": list(s.size())}
     try:
-        check = camera_check(project, candidates)
+        check = camera_check(project, reachable)
     except Exception as exc:  # noqa: BLE001 - diagnostics must never kill a job
         check = {"status": "error", "reason": str(exc)}
     diagnostics["camera_check"] = check
@@ -117,20 +118,67 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
             f"{check['best_variant']}. The facade will be misregistered until this is fixed."
         )
 
-    # --- stage 3: surface depth ---------------------------------------------
+    reach = float(max(abs((s.center - plane.origin) @ plane.w) for s in reachable)) + 1.0
+    band = max(opts.depth_front_m, opts.depth_back_m)
+
+    # --- dense geometry near the wall (one streamed pass, both sides if needed)
     phase = time.time()
-    points_wall, occluders = None, np.zeros((0, 3))
-    point_spacing = 0.05  # fallback when the cloud does not cover the wall
+    surface = region = None
+    cloud_stats = {"surface_capped": False}
     pc_source = project.points_source
     if opts.use_point_cloud and project.cloud is not None:
         _log(progress, f"Reading geometry near the wall from {pc_source}")
         surface, between, cloud_stats = project.cloud.wall_region(
-            plane, depth_front_m=opts.depth_front_m, depth_back_m=opts.depth_back_m,
-            reach_m=reach, max_occluders=opts.max_occluder_points)
-        if cloud_stats["surface_capped"]:
-            warnings.append("wall surface had more points than the cap; depth used a uniform sample")
+            plane, depth_front_m=band, depth_back_m=band, reach_m=reach,
+            max_occluders=opts.max_occluder_points, two_sided=plane.view_from is None)
         region = np.concatenate([surface, between])
         del between
+    timings["cloud_seconds"] = round(time.time() - phase, 1)
+    point_spacing = 0.05  # fallback when the cloud does not cover the wall
+    if surface is not None and len(surface):
+        sw = plane.to_wall(surface)
+        on = ((sw[:, 0] >= 0) & (sw[:, 0] < plane.width_m) & (sw[:, 1] >= 0)
+              & (sw[:, 1] < plane.height_m) & (np.abs(sw[:, 2]) <= 0.15))
+        if on.sum():
+            point_spacing = math.sqrt(plane.width_m * plane.height_m / on.sum())
+        del sw
+
+    if side_report is None:
+        if region is not None and len(region):
+            _log(progress, "Choosing the outside face of the wall from photo visibility")
+            side_report = choose_side(shots, plane, region, sel, opts.visibility, point_spacing)
+            if side_report.get("warning"):
+                warnings.append(side_report["warning"])
+        else:
+            centers = np.array([s.center for s in shots])
+            axes = np.array([s.optical_axis for s in shots])
+            side_report = {"method": "camera_vote", "flipped": plane.face_cameras(centers, axes)}
+            warnings.append("no geometry to check which side of the wall is outside; guessed from "
+                            "photo directions. Send wall.view_from from Studio to make it certain.")
+    if side_report.get("flipped"):
+        warnings.append("wall was turned around to face its outside; image reads left to right from outside")
+    _log(progress, "Wall side: " + json.dumps(side_report))
+
+    # --- candidate photos on the chosen side ---------------------------------
+    candidates = prefilter_shots(shots, plane, sel)
+    if not candidates:
+        hint = ""
+        if project.frame_report and project.frame_report.get("warnings"):
+            hint = " Note: " + "; ".join(project.frame_report["warnings"])
+        raise RuntimeError("no photos look at this wall from in front of it; check the wall corners "
+                           "or fly oblique passes facing this side." + hint + _camera_hint(check))
+    reach = float(max(((s.center - plane.origin) @ plane.w) for s in candidates)) + 1.0
+
+    # --- stage 3: surface depth ---------------------------------------------
+    phase = time.time()
+    points_wall, occluders = None, np.zeros((0, 3))
+    if region is not None:
+        if cloud_stats.get("surface_capped"):
+            warnings.append("wall surface had more points than the cap; depth used a uniform sample")
+        # keep only what can matter on the chosen side
+        rw = plane.to_wall(region)
+        region = region[(rw[:, 2] >= -opts.depth_back_m) & (rw[:, 2] <= reach)]
+        del rw
         if project.frame_report is not None:
             # fine snap against full-density geometry, before occluders are capped
             local = local_snap(project.shots, project.sparse, region, plane)
@@ -142,7 +190,7 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         if len(occluders) > opts.max_occluder_points:
             rng = np.random.default_rng(0)
             occluders = occluders[rng.choice(len(occluders), opts.max_occluder_points, replace=False)]
-        del region
+        region = None
         points_wall = plane.to_wall(surface) if len(surface) else None
     if points_wall is not None:
         near = ((points_wall[:, 0] >= 0) & (points_wall[:, 0] < plane.width_m)
@@ -171,6 +219,7 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         warnings.append(f"surface depth: {depth.source}; trim and recesses may show slight parallax")
     timings["depth_seconds"] = round(time.time() - phase, 1)
     _log(progress, f"Surface depth: {depth.source}")
+    diagnostics["side"] = side_report
     if len(occluders) == 0:
         warnings.append("no point cloud for occlusion checks; objects in front of the wall may smear onto it")
 
