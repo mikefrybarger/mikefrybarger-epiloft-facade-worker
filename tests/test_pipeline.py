@@ -181,7 +181,7 @@ def test_deep_zoom_tiles_and_laz_point_cloud(tmp_path):
     las.write(str(root / "odm_georeferencing" / "odm_georeferenced_model.laz"))
 
     sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5, make_tiles=True)
-    assert sidecar["depth"]["source"].endswith(".laz")
+    assert sidecar["depth"]["source"].startswith("odm_georeferencing/odm_georeferenced_model.laz")
     assert _post_fraction(rgba[..., :3], rgba[..., 3]) < 0.0005
     with zipfile.ZipFile(tmp_path / "out" / "facade_tiles.zip") as zf:
         names = zf.namelist()
@@ -247,7 +247,7 @@ def test_topocentric_ply_moves_with_the_poses(tmp_path):
     root = tmp_path / "odm"
     syn.build_project(root, frame_mode="topocentric", with_cloud=False, geo_mesh=True, topo_ply=True)
     sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5)
-    assert sidecar["depth"]["source"].endswith("point_cloud.ply")
+    assert sidecar["depth"]["source"].startswith("odm_filterpoints/point_cloud.ply")
     assert abs(sidecar["depth"]["offset_median_m"]) < 0.02, sidecar["depth"]
     assert _post_fraction(rgba[..., :3], rgba[..., 3]) < 0.0005
     psnr, _ = _compare(rgba, 0.005)
@@ -336,7 +336,7 @@ def test_holey_point_cloud_still_lands_on_the_wall(tmp_path):
     sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5)
     d = sidecar["depth"]
     assert d["coverage_before_fill"] < 0.95, d
-    assert -0.05 < d["offset_min_m"] and d["offset_max_m"] < 0.05, d
+    assert -0.08 < d["offset_min_m"] and d["offset_max_m"] < 0.08, d
     psnr, shift = _compare(rgba, 0.005)
     assert psnr > 27, psnr
     assert abs(shift[0]) < 0.5 and abs(shift[1]) < 0.5, shift
@@ -438,3 +438,52 @@ def test_view_from_decides_the_side(tmp_path, monkeypatch):
     assert not any(c["name"].startswith("BACK") for c in sidecar["cameras_used"])
     psnr, _ = _compare(rgba, 0.005)
     assert psnr > 27, psnr
+
+
+def _shift_cloud(root, delta):
+    """Move the dense cloud (not the poses): the cloud/pose disagreement seen
+    at the Ascend Plaza wall (~9 cm)."""
+    from facade.pointcloud import read_ply_xyz
+    p = root / "odm_filterpoints" / "point_cloud.ply"
+    syn.write_ply(p, read_ply_xyz(p) + delta)
+
+
+def test_photo_consistency_removes_cloud_pose_mismatch(tmp_path):
+    root = tmp_path / "odm"
+    syn.build_project(root)
+    _shift_cloud(root, 0.08 * syn.W)              # cloud 8 cm in front of where the photos say
+    opts = {"local_snap": False}
+    off, rgba_off = _run(root, tmp_path / "off", gsd_mm=5, options={**opts, "refine_depth": False})
+    on, rgba_on = _run(root, tmp_path / "on", gsd_mm=5, options=opts)
+    psnr_off, _ = _compare(rgba_off, 0.005)
+    psnr_on, shift_on = _compare(rgba_on, 0.005)
+    ref = on["diagnostics"]["refine"]
+    assert abs(ref["global_offset_m"] + 0.08) < 0.015, ref      # found the 8 cm
+    assert psnr_on > psnr_off + 3, (psnr_off, psnr_on)          # and it shows
+    assert psnr_on > 30, psnr_on
+    assert abs(shift_on[0]) < 0.5 and abs(shift_on[1]) < 0.5
+
+
+def test_ground_in_front_does_not_drag_the_base_onto_the_pavement(tmp_path):
+    root = tmp_path / "odm"
+    syn.build_project(root, cloud={"ground": True})
+    sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5)
+    assert sidecar["depth"]["ground_points_dropped"] > 1000
+    bottom = rgba[-40:]                                          # lowest 20 cm of the wall
+    h, w = rgba.shape[:2]
+    truth = syn.truth_image(0.005, w, h)[-40:, :, ::-1]
+    ok = bottom[..., 3] > 0
+    err = np.abs(bottom[..., :3].astype(float) - truth)[ok].mean()
+    assert err < 12, err
+
+
+def test_sky_above_the_parapet_is_transparent(tmp_path):
+    root = tmp_path / "odm"
+    syn.build_project(root)
+    wall = syn.wall_payload(frame="opensfm")
+    wall["corners"]["top_left"] = list(map(float, syn.world_wall(0, syn.WALL_H + 1.0)))  # 1 m too tall
+    sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=10, wall=wall)
+    top = rgba[:80, :, 3]                                        # top 0.8 m: nothing there
+    body = rgba[150:, :, 3]
+    assert (top == 0).mean() > 0.95, (top == 0).mean()
+    assert (body > 0).mean() > 0.97

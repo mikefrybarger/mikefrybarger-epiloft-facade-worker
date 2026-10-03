@@ -25,6 +25,7 @@ from .diagnostics import camera_check, overlay
 from .georef import local_snap
 from .geometry import OrthoGrid, WallPlane
 from .images import ImageCache, read_image
+from .refine import RefineConfig, refine_depth
 from .selection import SelectionConfig, mode_filter, prefilter_shots, score_views, solve_gains
 from .side import choose_side
 from .visibility import VisibilityConfig, ZBuffer, auto_downscale
@@ -33,8 +34,10 @@ from .visibility import VisibilityConfig, ZBuffer, auto_downscale
 @dataclass
 class FacadeOptions:
     gsd_mm: float | None = None          # None = native resolution of the best photos
-    depth_front_m: float = 0.6           # surface search in front of the plane (trim, sills)
-    depth_back_m: float = 0.5            # and behind it (recessed windows, doors)
+    depth_front_m: float = 1.2           # surface search in front of the plane (signs, columns, towers)
+    depth_back_m: float = 1.0            # and behind it (door alcoves, recessed entries)
+    planar_prior: bool = True            # wall is a plane unless a solid structure says otherwise
+    local_snap: bool = True              # fine pose snap onto the cloud at the wall
     depth_cell_mm: float | None = None   # None = from point density
     coarse_long_edge: int = 400          # coarse selection grid cells on the long edge
     tile_px: int = 1024
@@ -45,6 +48,7 @@ class FacadeOptions:
     use_point_cloud: bool = True
     selection: SelectionConfig = field(default_factory=SelectionConfig)
     visibility: VisibilityConfig = field(default_factory=VisibilityConfig)
+    refine: RefineConfig = field(default_factory=RefineConfig)
 
     @classmethod
     def from_payload(cls, data: dict | None):
@@ -54,10 +58,16 @@ class FacadeOptions:
                     "zbuffer_cells_per_spacing": "cells_per_spacing",
                     "occlusion_abs_tol_m": "abs_tol_m", "occlusion_rel_tol": "rel_tol"}
         vis = VisibilityConfig(**{vis_keys[k]: data.pop(k) for k in list(data) if k in vis_keys})
+        ref_keys = {"refine_depth": "enabled", "refine_cell_mm": "cell_m", "refine_search_m": "search_m",
+                    "refine_top_k": "top_k", "refine_min_confidence": "min_confidence"}
+        ref_args = {ref_keys[k]: data.pop(k) for k in list(data) if k in ref_keys}
+        if "cell_m" in ref_args:
+            ref_args["cell_m"] = float(ref_args["cell_m"]) / 1000.0
+        ref = RefineConfig(**ref_args)
         unknown = [k for k in data if k not in cls.__dataclass_fields__]
         if unknown:
             raise ValueError(f"unknown option(s): {', '.join(sorted(unknown))}")
-        return cls(selection=sel, visibility=vis, **data)
+        return cls(selection=sel, visibility=vis, refine=ref, **data)
 
 
 def _camera_hint(check):
@@ -179,7 +189,7 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         rw = plane.to_wall(region)
         region = region[(rw[:, 2] >= -opts.depth_back_m) & (rw[:, 2] <= reach)]
         del rw
-        if project.frame_report is not None:
+        if project.frame_report is not None and opts.local_snap:
             # fine snap against full-density geometry, before occluders are capped
             local = local_snap(project.shots, project.sparse, region, plane)
             warnings.extend(local.pop("warnings"))
@@ -208,7 +218,7 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
             cell = 0.05
         depth = build_depth_map(points_wall, plane.width_m, plane.height_m, cell_m=cell,
                                 depth_front_m=opts.depth_front_m, depth_back_m=opts.depth_back_m,
-                                source=pc_source)
+                                source=pc_source, planar_prior=opts.planar_prior)
     elif not opts.use_point_cloud:
         depth = flat_depth(plane.height_m, "point cloud disabled")
     elif project.cloud is None:
@@ -359,11 +369,24 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
     flat_valid = valid.reshape(len(kept), -1)
     gains = solve_gains(samples.reshape(len(kept), -1, 3), flat_valid, sel)
 
+    cache = ImageCache(int(opts.image_cache_gb * 1024 ** 3))
+
+    # --- stage 4b: nudge the surface until the photos agree ------------------
+    if opts.refine.enabled and depth.point_count > 0:
+        phase = time.time()
+        try:
+            depth, refine_info = refine_depth(plane, depth, kept, zbuffers, gains, cache, sel,
+                                              opts.refine, native_m, log=lambda m: _log(progress, m))
+        except Exception as exc:  # noqa: BLE001 - never lose the job to the refinement
+            refine_info = {"status": "error", "reason": str(exc)}
+            warnings.append(f"photo-consistency depth refinement failed ({exc}); used cloud depth")
+        diagnostics["refine"] = refine_info
+        timings["refine_seconds"] = round(time.time() - phase, 1)
+
     # --- stage 5b: fine pass, tile by tile ------------------------------------
     phase = time.time()
     out_path = Path(workdir) / "facade_rgba.u8"
     out = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=(grid.height_px, grid.width_px, 4))
-    cache = ImageCache(int(opts.image_cache_gb * 1024 ** 3))
     margin = 2 ** (opts.blend_levels + 1)
     tile = opts.tile_px
     tiles = [(r, c) for r in range(0, grid.height_px, tile) for c in range(0, grid.width_px, tile)]
@@ -408,7 +431,7 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         need = (idx < 0) & fvalid.any(axis=0)
         if need.any():
             idx[need] = fscores.argmax(axis=0)[need]
-        covered_t = idx >= 0
+        covered_t = (idx >= 0) & depth.valid_at(u, v)     # sky above the parapet stays clear
         composite = np.zeros((th, tw, 3), np.float32)
         for j in range(len(tile_cams)):
             composite[idx == j] = imgs[j][idx == j]

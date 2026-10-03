@@ -15,7 +15,8 @@ this one is **CPU only**.
 |---|---|---|
 | 1 Cameras | Poses and lens models from `opensfm/reconstruction.json`, projected with OpenSfM's own conventions (perspective, brown, fisheye, fisheye_opencv, radial, simple_radial). | `facade/cameras.py` |
 | 2 Grid | The picked corners become a wall frame: U along the wall, V up, W out toward the cameras. Corners picked "inside out" are flipped so the image always reads left to right from outside. | `facade/geometry.py` |
-| 3 Depth | The dense point cloud is rasterised onto the plane, frontmost point per cell. Trim, sills and recessed windows sit at their real depth, and a plane picked off the surface (on the eaves line, say) still lands on the wall. | `facade/depth.py` |
+| 3 Depth | The dense cloud is rasterised onto the plane (robust frontmost depth per cell, sidewalk at the base dropped). The wall is fitted as a plane; only solid structures (signs, columns, towers, door alcoves: connected, big enough, densely measured, with no wall visible behind them) keep their own depth. Glass stays on the wall plane, free-standing posts are obstacles, sky above the parapet is transparent. | `facade/depth.py` |
+| 4b Refine | Per patch, the depth is swept a few cm forward and back and the photos are compared; the depth where they agree wins. Removes the cloud/pose mismatch that ghosts lettering. Repeating patterns are held near the wall-wide offset. | `facade/refine.py` |
 | 4 Choice | Every candidate photo is scored per spot: square-on, close, and near the frame centre wins. A point-cloud z-buffer per photo rejects views blocked by trees, posts and overhangs. The winner map is smoothed so seams follow regions. | `facade/selection.py`, `facade/visibility.py` |
 | 5 Blend | Per-photo exposure gains are solved from overlaps, then a Laplacian-pyramid blend hides the seams without ghosting fine detail. Output is built in tiles, so wall size is bounded by disk, not RAM. | `facade/selection.py`, `facade/blend.py`, `facade/pipeline.py` |
 | 6 Outputs | Tiled BigTIFF, sidecar JSON, JPEG preview, optional deep-zoom tiles. | `facade/outputs.py` |
@@ -116,7 +117,10 @@ All optional. Unknown keys are rejected so a typo never silently does nothing.
 
 | Key | Default | Notes |
 |---|---|---|
-| `depth_front_m` / `depth_back_m` | 0.6 / 0.5 | How far in front of / behind the picked plane to look for the real surface. |
+| `depth_front_m` / `depth_back_m` | 1.2 / 1.0 | How far in front of / behind the picked plane to look for the real surface. |
+| `planar_prior` | true | Wall is a plane unless a solid structure says otherwise. |
+| `refine_depth` | true | Photo-consistency depth refinement. `refine_search_m` (0.15), `refine_cell_mm` (30), `refine_top_k` (4), `refine_min_confidence` (0.25). |
+| `local_snap` | true | Fine pose snap onto the cloud at the wall. |
 | `depth_cell_mm` | auto | Depth grid cell. Auto = 1.5x the point spacing on the wall, 10 to 100 mm. |
 | `use_point_cloud` | true | False = flat plane, no occlusion. Only for debugging. |
 | `max_incidence_deg` | 65 | Views more oblique than this are not used. |
