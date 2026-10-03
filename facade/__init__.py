@@ -1,0 +1,1 @@
+"""Epiloft facade orthomosaic worker."""
