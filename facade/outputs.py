@@ -135,6 +135,7 @@ def build_sidecar(result: dict, plane, frame_ctx, project, extra: dict) -> dict:
         "cameras_used": result["cameras_used"],
         "candidates_considered": result["candidates_considered"],
         "warnings": result["warnings"],
+        "diagnostics": result.get("diagnostics"),
         "timings": result["timings"],
         "options": result["options"],
         **extra,

@@ -25,10 +25,13 @@ class DepthMap:
     def sample(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
         if self.grid.size == 1:
             return np.full(np.shape(u), float(self.grid.flat[0]), dtype=np.float64)
-        mapx = (np.asarray(u) / self.cell_m - 0.5).astype(np.float32)
-        mapy = ((self.height_m - np.asarray(v)) / self.cell_m - 0.5).astype(np.float32)
+        u, v = np.asarray(u, dtype=np.float64), np.asarray(v, dtype=np.float64)
+        shape = u.shape
+        mapx = (u / self.cell_m - 0.5).astype(np.float32).reshape(1, -1) if u.ndim != 2 else \
+            (u / self.cell_m - 0.5).astype(np.float32)
+        mapy = ((self.height_m - v) / self.cell_m - 0.5).astype(np.float32).reshape(mapx.shape)
         out = cv2.remap(self.grid, mapx, mapy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        return out.astype(np.float64)
+        return out.astype(np.float64).reshape(shape)
 
     def stats(self) -> dict:
         g = self.grid

@@ -19,6 +19,7 @@ import numpy as np
 
 from .blend import multiband_blend
 from .depth import build_depth_map, flat_depth
+from .diagnostics import camera_check, overlay
 from .georef import local_snap
 from .geometry import OrthoGrid, WallPlane
 from .images import ImageCache, read_image
@@ -56,6 +57,13 @@ class FacadeOptions:
         return cls(selection=sel, visibility=vis, **data)
 
 
+def _camera_hint(check):
+    if check and check.get("status") in ("failed", "marginal"):
+        return (f". Camera check {check['status']}: OpenSfM's own points reproject "
+                f"{check['median_px']} px off (best fit: {check['best_variant']})")
+    return ""
+
+
 def _log(progress, msg):
     print(msg, flush=True)
     if progress:
@@ -88,6 +96,26 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         raise RuntimeError("no photos look at this wall from in front of it; check the wall corners "
                            "or fly oblique passes facing this side." + hint)
     reach = float(max(((s.center - plane.origin) @ plane.w) for s in candidates)) + 1.0
+
+    # --- self-check: does this worker's camera code reproduce OpenSfM? -------
+    diagnostics = {"cameras": {}}
+    for s in candidates:
+        cam = s.camera
+        if cam.id not in diagnostics["cameras"]:
+            diagnostics["cameras"][cam.id] = {"raw": cam.raw, "image_size_seen": list(s.size())}
+    try:
+        check = camera_check(project, candidates)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never kill a job
+        check = {"status": "error", "reason": str(exc)}
+    diagnostics["camera_check"] = check
+    _log(progress, "Camera check: " + ", ".join(f"{k}={v}" for k, v in check.items()
+                                                 if k in ("status", "median_px", "best_variant", "reason")))
+    if check.get("status") in ("failed", "marginal"):
+        warnings.append(
+            f"camera check {check['status']}: this worker reprojects OpenSfM's own sparse points "
+            f"{check['median_px']} px off (median) in the source photos; best-fitting interpretation: "
+            f"{check['best_variant']}. The facade will be misregistered until this is fixed."
+        )
 
     # --- stage 3: surface depth ---------------------------------------------
     phase = time.time()
@@ -203,7 +231,8 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
 
     n = len(shortlist)
     if n == 0:
-        raise RuntimeError("no photo sees this wall unobstructed; check the wall corners and the capture")
+        raise RuntimeError("no photo sees this wall unobstructed; check the wall corners and the capture"
+                           + _camera_hint(check))
     candidates_checked = int(tried.sum())
     _log(progress, f"Occlusion-checked {candidates_checked} of {n_all} photos; {n} see the wall")
     scores = np.stack([vis_scores[k] for k in shortlist])
@@ -370,6 +399,15 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
             "gain_bgr": [round(float(g), 4) for g in gains[k]],
         })
     cams_used.sort(key=lambda c: -c["share"])
+    by_name = {s.name: s for s in kept}
+    overlays = []
+    for c in cams_used[:3]:
+        try:
+            overlays.append({"name": c["name"],
+                             "jpeg_base64": overlay(by_name[c["name"]], plane, depth, project)})
+        except Exception as exc:  # noqa: BLE001
+            overlays.append({"name": c["name"], "error": str(exc)})
+    diagnostics["overlays"] = overlays
     timings["total_seconds"] = round(time.time() - t0, 1)
 
     return {
@@ -386,6 +424,7 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         "cameras_used": cams_used,
         "image_decodes": cache.decodes,
         "warnings": warnings,
+        "diagnostics": diagnostics,
         "timings": timings,
         "options": _jsonable(asdict(opts)),
     }

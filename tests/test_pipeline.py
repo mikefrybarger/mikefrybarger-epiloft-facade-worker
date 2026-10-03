@@ -66,6 +66,11 @@ def test_matches_ground_truth_and_removes_post(project, tmp_path):
     assert abs(shift[0]) < 0.5 and abs(shift[1]) < 0.5, shift
     assert _post_fraction(rgba[..., :3], rgba[..., 3]) < 0.0005
     assert len(sidecar["cameras_used"]) >= 4
+    chk = sidecar["diagnostics"]["camera_check"]
+    assert chk["status"] == "ok" and chk["median_px"] < 1.0, chk
+    assert chk["best_variant"] == "as_is", chk
+    assert len(sidecar["diagnostics"]["overlays"]) == 3
+    assert sidecar["diagnostics"]["overlays"][0]["jpeg_base64"][:4] == "/9j/"  # JPEG
     assert all("NADIR" not in c["name"] for c in sidecar["cameras_used"])
     assert sidecar["depth"]["surface_points"] > 10_000
     assert abs(sidecar["depth"]["offset_median_m"]) < 0.01
@@ -335,3 +340,14 @@ def test_holey_point_cloud_still_lands_on_the_wall(tmp_path):
     psnr, shift = _compare(rgba, 0.005)
     assert psnr > 27, psnr
     assert abs(shift[0]) < 0.5 and abs(shift[1]) < 0.5, shift
+
+
+def test_camera_check_catches_a_misread_camera(project, tmp_path, monkeypatch):
+    """If the camera code were wrong (here: rotation read transposed), the
+    check must say so and name the interpretation that does fit."""
+    import facade.cameras as cams
+
+    real = cams.rodrigues
+    monkeypatch.setattr(cams, "rodrigues", lambda r: real(r).T)
+    with pytest.raises(RuntimeError, match=r"Camera check failed.*best fit: rotation_transposed"):
+        _run(project, tmp_path, gsd_mm=20)

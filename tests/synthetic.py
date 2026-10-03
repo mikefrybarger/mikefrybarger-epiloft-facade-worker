@@ -182,6 +182,30 @@ def write_geo_obj(path: Path, pts_offset: np.ndarray):
     path.write_text("mtllib odm_textured_model_geo.mtl\n" + "\n".join(lines) + "\nf 1 2 3\n")
 
 
+def project_true(R, c, X):
+    """Ground-truth projection (independent of facade.cameras): normalized coords."""
+    pc = (X - c) @ R.T
+    x, y = pc[:, 0] / pc[:, 2], pc[:, 1] / pc[:, 2]
+    r2 = x * x + y * y
+    k = CAMERA
+    radial = 1 + r2 * (k["k1"] + r2 * (k["k2"] + r2 * k["k3"]))
+    xd = x * radial + 2 * k["p1"] * x * y + k["p2"] * (r2 + 2 * x * x)
+    yd = y * radial + 2 * k["p2"] * x * y + k["p1"] * (r2 + 2 * y * y)
+    return k["focal_x"] * xd + k["c_x"], k["focal_y"] * yd + k["c_y"], pc[:, 2]
+
+
+def write_tracks(root, cams, sparse_offset, frame_mode):
+    """OpenSfM tracks.csv (v2) with each sparse point's true detection per photo."""
+    lines = ["OPENSFM_TRACKS_VERSION_v2"]
+    for name, c, target in cams:
+        R = look_at(c, target)
+        x, y, z = project_true(R, c, sparse_offset)
+        ok = (z > 0) & (np.abs(x) < 0.5) & (np.abs(y) < 0.375)
+        for i in np.flatnonzero(ok)[:400]:
+            lines.append(f"{name}\t{i}\t{i}\t{x[i]:.6f}\t{y[i]:.6f}\t0.004\t128\t128\t128\t-1\t-1")
+    (root / "opensfm" / "tracks.csv").write_text("\n".join(lines) + "\n")
+
+
 def build_project(root: Path, *, gains=None, with_cloud=True, cloud=None, frame_mode="marker",
                   geo_mesh=False, topo_ply=False):
     """frame_mode: "marker" (offset poses + topocentric marker file, like ODM),
@@ -204,6 +228,7 @@ def build_project(root: Path, *, gains=None, with_cloud=True, cloud=None, frame_
                        "translation": (-R @ c).tolist()}
     dense = point_cloud(**(cloud or {}))
     sparse = dense[rng.choice(len(dense), 3000, replace=False)] + rng.normal(0, 0.01, (3000, 3))
+    sparse_offset_frame = sparse.copy()
     if frame_mode == "topocentric":
         to_topo = offset_to_topocentric_fn()
         # local rotation of the frame change, from the exact map
@@ -221,6 +246,7 @@ def build_project(root: Path, *, gains=None, with_cloud=True, cloud=None, frame_
         (root / "opensfm" / "reference_lla.json").write_text(json.dumps(
             {"latitude": REF_LLA["lat"], "longitude": REF_LLA["lon"], "altitude": REF_LLA["alt"]}))
     points = {str(i): {"coordinates": p.tolist()} for i, p in enumerate(sparse)}
+    write_tracks(root, cams, sparse_offset_frame, frame_mode)
     recon = [{"cameras": {"synthetic": CAMERA}, "shots": shots, "points": points}]
     (root / "opensfm" / "reconstruction.json").write_text(json.dumps(recon))
     if frame_mode == "marker":

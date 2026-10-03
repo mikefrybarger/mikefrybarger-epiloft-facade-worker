@@ -31,6 +31,7 @@ class Camera:
     width: int
     height: int
     params: dict
+    raw: dict | None = None
 
     @classmethod
     def from_json(cls, cam_id: str, data: dict):
@@ -42,7 +43,7 @@ class Camera:
             )
         params = {k: float(v) for k, v in data.items()
                   if isinstance(v, (int, float)) and k not in ("width", "height")}
-        return cls(cam_id, model, int(data["width"]), int(data["height"]), params)
+        return cls(cam_id, model, int(data["width"]), int(data["height"]), params, dict(data))
 
     def _p(self, key, default=0.0):
         return self.params.get(key, default)
@@ -151,8 +152,10 @@ class Shot:
         return np.asarray(depth) / self.camera.focal_px(w, h)
 
 
-def load_reconstruction(path: Path):
-    """First reconstruction in reconstruction.json -> (shots, sparse points (N,3) or None)."""
+def load_reconstruction(path: Path, with_ids: bool = False):
+    """First reconstruction in reconstruction.json -> (shots, sparse points (N,3) or None).
+
+    with_ids=True also returns the sparse point ids (OpenSfM track ids)."""
     data = json.loads(Path(path).read_text())
     if isinstance(data, dict):
         data = [data]
@@ -177,6 +180,14 @@ def load_reconstruction(path: Path):
         others = sum(len(r.get("shots") or {}) for r in data[1:])
         print(f"note: reconstruction.json has {len(data)} partial reconstructions; "
               f"using the first ({len(shots)} shots, {others} shots in the others)", flush=True)
-    pts = [p.get("coordinates") for p in (recon.get("points") or {}).values()]
-    pts = np.asarray([p for p in pts if p and len(p) == 3], dtype=np.float64)
-    return shots, (pts if len(pts) else None)
+    ids, pts = [], []
+    for pid, p in (recon.get("points") or {}).items():
+        c = p.get("coordinates")
+        if c and len(c) == 3:
+            ids.append(str(pid))
+            pts.append(c)
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+    sparse = pts if len(pts) else None
+    if with_ids:
+        return shots, sparse, ids
+    return shots, sparse

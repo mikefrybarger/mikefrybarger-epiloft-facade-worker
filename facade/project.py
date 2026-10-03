@@ -54,6 +54,7 @@ class Project:
     cloud: CloudSource | None = None   # streamed dense geometry, in the shots' frame
     frame_report: dict | None = None
     sparse: object = None              # OpenSfM sparse points, moved with the shots
+    sparse_ids: list | None = None     # their track ids (for the tracks.csv check)
 
     @property
     def points_source(self):
@@ -78,7 +79,7 @@ def parse_coords(path: Path):
 
 def load_project(search_dir: Path) -> Project:
     root = find_project_root(search_dir)
-    shots, sparse = load_reconstruction(root / "opensfm" / "reconstruction.json")
+    shots, sparse, sparse_ids = load_reconstruction(root / "opensfm" / "reconstruction.json", with_ids=True)
 
     index = {}
     for p in search_dir.rglob("*"):
@@ -147,4 +148,4 @@ def load_project(search_dir: Path) -> Project:
         print("pose frame: " + json.dumps({k: v for k, v in report.items() if k != "warnings"}), flush=True)
     return Project(root=root, shots=usable, offset_e=oe, offset_n=on, epsg=epsg,
                    source_frame=frame, missing_images=missing, cloud=cloud, frame_report=report,
-                   sparse=sparse)
+                   sparse=sparse, sparse_ids=sparse_ids)
