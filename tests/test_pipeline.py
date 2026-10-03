@@ -320,3 +320,18 @@ def test_many_photos_do_not_drift_dark():
     assert 0.95 < np.median(gains) < 1.05, np.median(gains)
     assert (gains > 0.5 + 1e-6).all() and (gains < 2.0 - 1e-6).all()
     assert np.std(corrected) / np.mean(corrected) < 0.08
+
+
+def test_holey_point_cloud_still_lands_on_the_wall(tmp_path):
+    """Regression for the real Ascend Plaza job: gaps in the cloud plus a fine
+    depth grid made the old hole filler invent metre-scale depths, and the
+    facade came out as smeared roofs and parking lot."""
+    root = tmp_path / "odm"
+    syn.build_project(root, cloud={"spacing": 0.015, "dropout": 0.4})
+    sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5)
+    d = sidecar["depth"]
+    assert d["coverage_before_fill"] < 0.95, d
+    assert -0.05 < d["offset_min_m"] and d["offset_max_m"] < 0.05, d
+    psnr, shift = _compare(rgba, 0.005)
+    assert psnr > 27, psnr
+    assert abs(shift[0]) < 0.5 and abs(shift[1]) < 0.5, shift

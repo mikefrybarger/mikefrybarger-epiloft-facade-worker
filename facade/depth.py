@@ -73,16 +73,33 @@ def build_depth_map(wall_pts: np.ndarray, width_m: float, height_m: float, *,
     coverage = float(filled.mean())
     if coverage < min_coverage:
         return flat_depth(height_m, f"point coverage {coverage:.1%} is too sparse")
+    grid = np.where(filled, grid, 0.0)
 
-    g32 = np.where(filled, grid, 0.0).astype(np.float32)
-    if not filled.all():
-        holes = (~filled).astype(np.uint8)
-        g32 = cv2.inpaint(g32, holes, 3, cv2.INPAINT_TELEA)
+    g32 = fill_nearest(grid, filled).astype(np.float32)
     # Single stray points in front of the wall (noise, a bug, a wire) would
     # otherwise pull a whole cell forward.
     if min(g32.shape) >= 5:
         g32 = cv2.medianBlur(g32, 5)
     elif min(g32.shape) >= 3:
         g32 = cv2.medianBlur(g32, 3)
+    # The surface can only be inside the search band; never let filtering
+    # or filling put it anywhere else.
+    g32 = np.clip(g32, -depth_back_m, depth_front_m)
     return DepthMap(cell_m=cell_m, height_m=height_m, grid=g32, coverage=coverage,
                     point_count=int(len(w)), source=source)
+
+
+def fill_nearest(grid: np.ndarray, known: np.ndarray) -> np.ndarray:
+    """Fill unknown cells with the value of the nearest known cell.
+
+    Deliberately simple: the result can never leave the range of the real
+    measurements. (cv2.inpaint was used here first; on float data it
+    extrapolated -0.3..0.2 m depths to -1.8..1.5 m, which threw every
+    back-projected pixel metres off the wall on a real job.)
+    """
+    if known.all():
+        return grid
+    from scipy.ndimage import distance_transform_edt  # noqa: PLC0415
+
+    _, (iy, ix) = distance_transform_edt(~known, return_indices=True)
+    return grid[iy, ix]

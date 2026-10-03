@@ -126,7 +126,8 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         if opts.depth_cell_mm:
             cell = opts.depth_cell_mm / 1000.0
         elif n_surface:
-            cell = float(np.clip(1.5 * point_spacing, 0.01, 0.10))
+            # 2 cm is plenty for trim and recesses; finer grids only add holes
+            cell = float(np.clip(2.0 * point_spacing, 0.02, 0.10))
         else:
             cell = 0.05
         depth = build_depth_map(points_wall, plane.width_m, plane.height_m, cell_m=cell,

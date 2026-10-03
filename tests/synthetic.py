@@ -119,10 +119,15 @@ def write_ply(path: Path, pts: np.ndarray):
     path.write_bytes(header + pts.tobytes())
 
 
-def point_cloud(spacing=0.03, seed=0, post_ring=24, post_step=0.03, ground=False):
+def point_cloud(spacing=0.03, seed=0, post_ring=24, post_step=0.03, ground=False, dropout=0.0):
     rng = np.random.default_rng(seed)
     uu, vv = np.meshgrid(np.arange(0, WALL_W, spacing), np.arange(0, WALL_H, spacing))
     wall = world_wall(uu.ravel(), vv.ravel(), rng.normal(0, 0.004, uu.size))
+    if dropout:  # glass, dark paint, sparse matching: scattered gaps plus a window
+        uf, vf = uu.ravel(), vv.ravel()
+        keep = rng.random(len(wall)) > dropout
+        keep &= ~((uf > 1.0) & (uf < 2.2) & (vf > 1.0) & (vf < 2.2))
+        wall = wall[keep]
     ang = np.linspace(0, 2 * np.pi, post_ring, endpoint=False)
     zs = np.arange(-0.2, WALL_H + 0.5, post_step)
     aa, zz = np.meshgrid(ang, zs)

@@ -106,3 +106,23 @@ def test_ply_reader(tmp_path):
     rec["x"], rec["y"], rec["z"] = pts[:, 0], pts[:, 1], pts[:, 2]
     p.write_bytes(hdr + rec.tobytes())
     assert np.allclose(read_ply_xyz(p), pts)
+
+
+def test_depth_map_with_holes_stays_in_band():
+    """Regression: scattered holes (glass, sparse areas) must never produce
+    depths outside what was measured, let alone outside the search band."""
+    from facade.depth import build_depth_map
+
+    rng = np.random.default_rng(0)
+    u = rng.uniform(0, 10, 200_000)
+    v = rng.uniform(0, 4, 200_000)
+    w = np.where(u < 5, 0.2, -0.3) + rng.normal(0, 0.005, u.size)   # a step in the wall
+    keep = rng.random(u.size) > 0.35                                 # scattered dropout
+    keep &= ~((u > 2) & (u < 3) & (v > 1) & (v < 2.5))               # a window with no points
+    pts = np.stack([u[keep], v[keep], w[keep]], -1)
+    d = build_depth_map(pts, 10, 4, cell_m=0.02, depth_front_m=0.6, depth_back_m=0.5)
+    assert d.coverage < 0.95                                         # holes really exist
+    assert d.grid.min() >= -0.32 and d.grid.max() <= 0.22, (d.grid.min(), d.grid.max())
+    # the window is filled from its surroundings, not invented
+    win = d.sample(np.array([2.5]), np.array([1.75]))[0]
+    assert abs(win - 0.2) < 0.02
