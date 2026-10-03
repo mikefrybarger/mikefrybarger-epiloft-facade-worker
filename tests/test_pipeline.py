@@ -351,3 +351,37 @@ def test_camera_check_catches_a_misread_camera(project, tmp_path, monkeypatch):
     monkeypatch.setattr(cams, "rodrigues", lambda r: real(r).T)
     with pytest.raises(RuntimeError, match=r"Camera check failed.*best fit: rotation_transposed"):
         _run(project, tmp_path, gsd_mm=20)
+
+
+M4E = {"projection_type": "brown", "focal_x": 0.7052558642285107, "focal_y": 0.7052558642285107,
+       "c_x": 0.004969223516840049, "c_y": -0.00470324524625981, "k1": -0.10341031555259611,
+       "k2": -0.01531662859893411, "p1": 2.6876150908751606e-06, "p2": -0.00020501113013549115,
+       "k3": -0.005277757045775089}
+
+
+def test_real_m4e_lens_and_photos_looking_along_the_wall(tmp_path, monkeypatch):
+    """Regression for the Ascend Plaza job: with the real DJI M4E calibration,
+    rays past 53 deg off-axis fold back into the photo (63.5 deg lands on the
+    image centre). Photos parked in front of the wall but aimed along it were
+    "seeing" wall that was outside their frame, and the facade was painted
+    from pavement and roofs."""
+    monkeypatch.setattr(syn, "CAMERA", dict(syn.CAMERA, **M4E))
+    base = syn.camera_positions
+
+    def with_decoys():
+        cams = base()
+        for i, uu in enumerate((0.5, 2.5, 4.5)):
+            c = syn.world_wall(uu, 1.6, 3.0)
+            target = c + 10.0 * syn.U - 2.5 * syn.W     # mostly along the wall
+            cams.append((f"DECOY_{i}.JPG", c, target))
+        return cams
+    monkeypatch.setattr(syn, "camera_positions", with_decoys)
+    root = tmp_path / "odm"
+    syn.build_project(root)
+    sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5)
+    used = [c["name"] for c in sidecar["cameras_used"]]
+    assert not any(n.startswith("DECOY") and c["share"] > 0.02
+                   for n, c in zip(used, sidecar["cameras_used"])), sidecar["cameras_used"]
+    psnr, shift = _compare(rgba, 0.005)
+    assert psnr > 26, psnr
+    assert abs(shift[0]) < 0.5 and abs(shift[1]) < 0.5, shift
