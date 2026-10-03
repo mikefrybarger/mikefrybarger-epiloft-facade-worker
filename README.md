@@ -20,6 +20,15 @@ this one is **CPU only**.
 | 5 Blend | Per-photo exposure gains are solved from overlaps, then a Laplacian-pyramid blend hides the seams without ghosting fine detail. Output is built in tiles, so wall size is bounded by disk, not RAM. | `facade/selection.py`, `facade/blend.py`, `facade/pipeline.py` |
 | 6 Outputs | Tiled BigTIFF, sidecar JSON, JPEG preview, optional deep-zoom tiles. | `facade/outputs.py` |
 
+## Lens models are clipped to the photo
+
+Polynomial lens models are only fitted inside the photo. The DJI M4E
+calibration on the first real job folds back at 53 degrees off-axis and maps
+rays at 63.5 degrees onto the image centre, so wall far outside a photo was
+"seen" in it. `Camera.valid_angle` finds, per lens and image size, the
+largest ray angle that projects monotonically and lands no further than just
+past the image corners; anything beyond it never projects.
+
 ## Which frame are the camera poses in?
 
 ODM writes `opensfm/reconstruction.json` either in the georeferenced offset
@@ -65,7 +74,8 @@ textured mesh vertices.
         "bottom_right": [x, y, z],
         "top_left":     [x, y, z]
       },
-      "mesh_origin": {"e": 643850.0, "n": 4884555.0, "z": 1.0}
+      "mesh_origin": {"e": 643850.0, "n": 4884555.0, "z": 1.0},
+      "view_from": [x, y, z]
     },
     "gsd_mm": "native",
     "ortho_upload_url":   "https://SIGNED-UPLOAD-URL",
@@ -78,6 +88,13 @@ textured mesh vertices.
   }
 }
 ```
+
+**`wall.view_from`** (recommended). Where the viewer stood when picking the
+wall, in the same frame as the corners: Studio's camera position. Corners
+define a plane, not a side; this says which face is the outside. Without it
+the worker decides by visibility: per side, how many (photo, wall point)
+pairs are in a photo's real field of view and not blocked by the dense
+geometry. The decision is in `facade.json` under `diagnostics.side`.
 
 **`wall.frame`.** `"mesh"` means Studio's three.js scene coordinates (Y up).
 The worker inverts the splat worker's `splat_to_mesh` contract exactly

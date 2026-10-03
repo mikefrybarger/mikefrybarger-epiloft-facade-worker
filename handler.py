@@ -13,6 +13,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import numpy as np
+
 from facade.geometry import FrameContext, WallPlane
 from facade.outputs import (build_sidecar, write_full_jpeg, write_json, write_preview, write_tiff,
                             write_tiles)
@@ -20,7 +22,7 @@ from facade.pipeline import FacadeOptions, run_facade
 from facade.project import load_project, safe_extract
 from facade.transfer import download, refresh_upload_urls, require_http_url, upload
 
-WORKER_VERSION = "2026-10-03.5"
+WORKER_VERSION = "2026-10-03.6"
 GB = 1024 ** 3
 DISK_HEADROOM_FACTOR = 2.5
 
@@ -50,7 +52,10 @@ def parse_wall(spec: dict, project) -> tuple[WallPlane, FrameContext | None]:
     spec = {
       "frame": "mesh" | "opensfm",
       "corners": {"bottom_left": [x,y,z], "bottom_right": [...], "top_left": [...]},
-      "mesh_origin": {"e": .., "n": .., "z": ..}    # required for frame "mesh"
+      "mesh_origin": {"e": .., "n": .., "z": ..},   # required for frame "mesh"
+      "view_from": [x, y, z]     # optional but recommended: where the viewer stood when
+                                 # picking the wall (Studio camera position), same frame
+                                 # as the corners. Decides which face is the outside.
     }
     """
     if not isinstance(spec, dict):
@@ -77,7 +82,16 @@ def parse_wall(spec: dict, project) -> tuple[WallPlane, FrameContext | None]:
             ctx = FrameContext.from_payload((project.offset_e, project.offset_n), spec["mesh_origin"])
     else:
         raise ValueError("wall.frame must be 'mesh' or 'opensfm'")
-    return WallPlane.from_corners(*pts), ctx
+    plane = WallPlane.from_corners(*pts)
+    view = spec.get("view_from")
+    if view is not None:
+        if not isinstance(view, (list, tuple)) or len(view) != 3:
+            raise ValueError("wall.view_from must be [x, y, z] in the same frame as the corners")
+        view = ctx.mesh_to_opensfm(view) if frame == "mesh" else np.asarray(view, dtype=np.float64)
+        if abs(float((view - plane.origin) @ plane.w)) < 0.25:
+            raise ValueError("wall.view_from lies in the wall plane; send the Studio camera position")
+        plane.view_from = view
+    return plane, ctx
 
 
 def produce(project_dir: Path, job_input: dict, out_dir: Path, progress=None) -> dict:
@@ -100,8 +114,6 @@ def produce(project_dir: Path, job_input: dict, out_dir: Path, progress=None) ->
     out_dir.mkdir(parents=True, exist_ok=True)
     result = run_facade(project, plane, opts, out_dir, progress)
     grid = result["grid"]
-
-    import numpy as np  # noqa: PLC0415
 
     outputs_started = time.time()
     raster = np.memmap(result["raster_path"], dtype=np.uint8, mode="r",
