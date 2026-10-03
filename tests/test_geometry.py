@@ -149,3 +149,28 @@ def test_m4e_lens_model_never_folds_back_into_the_image():
         r = np.hypot(px[ok] - pp_x, py[ok] - pp_y)
         assert np.all(np.diff(r) > 0)                     # strictly outward: no fold
         assert not np.any(ok & (np.degrees(ang) > 52))    # nothing from outside the field
+
+
+def test_windows_stay_on_the_wall_and_posts_are_obstacles():
+    """Glass: sparse interior points behind it, must stay on the wall plane.
+    Post in front with wall visible behind it: an obstacle, not facade.
+    Sign: solid, no wall behind it: keeps its own depth."""
+    from facade.depth import build_depth_map
+
+    rng = np.random.default_rng(1)
+    n = 300_000
+    u, v = rng.uniform(0, 10, n), rng.uniform(0, 4, n)
+    w = rng.normal(0, 0.004, n)
+    glass = (u > 2) & (u < 4) & (v > 0.8) & (v < 2.5)
+    sign = (u > 6) & (u < 9) & (v > 3.0) & (v < 3.6)
+    keep = ~glass | (rng.random(n) < 0.08)                       # few points through glass
+    w = np.where(glass, -0.6 + rng.normal(0, 0.1, n), w)         # ...from the shop interior
+    w = np.where(sign, 0.25, w)                                  # sign face 25 cm proud
+    pts = [np.stack([u[keep], v[keep], w[keep]], -1)]
+    pu, pv = rng.uniform(4.9, 5.1, 20000), rng.uniform(0, 4, 20000)
+    pts.append(np.stack([pu, pv, np.full_like(pu, 0.9)], -1))  # post 0.9 m in front
+    d = build_depth_map(np.concatenate(pts), 10, 4, cell_m=0.02, depth_front_m=1.2, depth_back_m=1.0)
+    s = lambda uu, vv: d.sample(np.array([uu]), np.array([vv]))[0]   # noqa: E731
+    assert abs(s(3.0, 1.6)) < 0.02, s(3.0, 1.6)      # window: wall plane
+    assert abs(s(5.0, 1.5)) < 0.02, s(5.0, 1.5)      # behind the post: wall plane
+    assert abs(s(7.5, 3.3) - 0.25) < 0.03, s(7.5, 3.3)   # sign keeps its depth
