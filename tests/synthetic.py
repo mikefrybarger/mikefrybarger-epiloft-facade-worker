@@ -65,7 +65,7 @@ def undistort_brown(xd, yd, c):
     return x, y
 
 
-def render(R, C, gain):
+def render(R, C, gain, shade=None):
     size = max(IMG_W, IMG_H)
     pxs, pys = np.meshgrid(np.arange(IMG_W, dtype=float), np.arange(IMG_H, dtype=float))
     nx = (pxs - (IMG_W / 2 - 0.5)) / size
@@ -95,6 +95,11 @@ def render(R, C, gain):
     post = (disc >= 0) & (t_post > 0) & (zhit >= ORIGIN[2] - 0.2) & (zhit <= ORIGIN[2] + WALL_H + 0.5)
     post &= ~on_wall | (t_post < t_wall)
     img = np.where(post[..., None], np.array([235.0, 20.0, 235.0]), img)  # magenta: no wall colour is close
+    if shade is not None:  # brightness drifting across the frame: lens falloff + a sun-angle gradient
+        a, b, tint = shade
+        xn, yn = pxs / IMG_W - 0.5, pys / IMG_H - 0.5
+        field = (1 + a * xn + b * yn) * (1 - 0.35 * (xn * xn + yn * yn) * 2)
+        img = img * field[..., None] * np.asarray(tint)[None, None, :]
     return np.clip(img * gain, 0, 255).astype(np.uint8)
 
 
@@ -220,7 +225,7 @@ def write_tracks(root, cams, sparse_offset, frame_mode):
 
 
 def build_project(root: Path, *, gains=None, with_cloud=True, cloud=None, frame_mode="marker",
-                  geo_mesh=False, topo_ply=False):
+                  geo_mesh=False, topo_ply=False, shading=False):
     """frame_mode: "marker" (offset poses + topocentric marker file, like ODM),
     "nomarker" (offset poses, no marker, LAZ only), "topocentric" (poses in
     OpenSfM's local ENU frame, no marker, LAZ only: the Lightning all.zip case)."""
@@ -235,7 +240,11 @@ def build_project(root: Path, *, gains=None, with_cloud=True, cloud=None, frame_
     shots = {}
     for (name, c, target), g in zip(cams, gains):
         R = look_at(c, target)
-        cv2.imwrite(str(root / "images" / name), render(R, c, g), [cv2.IMWRITE_JPEG_QUALITY, 95])
+        shade = None
+        if shading:
+            shade = (rng.uniform(-0.35, 0.35), rng.uniform(-0.35, 0.35),
+                     (rng.uniform(0.92, 1.08), 1.0, rng.uniform(0.92, 1.08)))
+        cv2.imwrite(str(root / "images" / name), render(R, c, g, shade), [cv2.IMWRITE_JPEG_QUALITY, 95])
         rvec, _ = cv2.Rodrigues(R)
         shots[name] = {"camera": "synthetic", "rotation": rvec.ravel().tolist(),
                        "translation": (-R @ c).tolist()}

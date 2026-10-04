@@ -140,3 +140,46 @@ def solve_gains(samples: np.ndarray, valid: np.ndarray, cfg: SelectionConfig) ->
         if keep.any():
             gains /= np.exp(np.average(logs[keep], weights=weight[keep]))
     return np.clip(gains, *cfg.gain_clamp)
+
+
+def local_gain_fields(samples: np.ndarray, valid: np.ndarray, gains: np.ndarray, sigma_cells: float,
+                      clamp=(0.7, 1.45)) -> np.ndarray:
+    """Per-photo, per-channel gain maps that level brightness *within* photos.
+
+    One gain per photo fixes overall exposure, but brightness also drifts
+    across a frame (lens falloff, sun angle, sky in glass, a wall turning
+    away from the light), so neighbouring photos still disagree locally and
+    the facade comes out blotchy. At every coarse cell the consensus colour
+    is the median of the photos that see it; each photo's ratio to the
+    consensus is smoothed over ~sigma_cells (normalized convolution, so gaps
+    do not drag it) and clamped.
+
+    samples: (n, H, W, 3) BGR at the coarse grid, valid: (n, H, W),
+    gains: (n, 3). Returns (n, H, W, 3) multipliers applied on top of gains.
+    """
+    n = samples.shape[0]
+    levelled = samples * gains[:, None, None, :].astype(np.float32)
+    stack = np.where(valid[..., None], levelled, np.nan)
+    with np.errstate(all="ignore"):
+        cons = np.nanmedian(stack, axis=0)                     # (H, W, 3)
+    luma_c = cons @ np.array([0.114, 0.587, 0.299])
+    fields = np.ones_like(levelled, dtype=np.float32)
+    ksize = (0, 0)
+    for k in range(n):
+        luma_k = levelled[k] @ np.array([0.114, 0.587, 0.299])
+        use = valid[k] & np.isfinite(luma_c) & (luma_c > 25) & (luma_k > 15) & (luma_k < 250)
+        if use.sum() < 10:
+            continue
+        wgt = cv2.GaussianBlur(use.astype(np.float32), ksize, sigma_cells)
+        for c in range(3):
+            with np.errstate(all="ignore"):
+                lr = np.log(np.clip(cons[..., c], 1, None) / np.clip(levelled[k][..., c], 1, None))
+            lr = np.where(use, np.clip(lr, -0.4, 0.4), 0.0).astype(np.float32)
+            num = cv2.GaussianBlur(lr, ksize, sigma_cells)
+            sm = np.where(wgt > 1e-3, num / np.maximum(wgt, 1e-6), 0.0)
+            # outside the photo's coverage, extend with a much wider blur
+            wide_w = cv2.GaussianBlur(use.astype(np.float32), ksize, sigma_cells * 4)
+            wide = cv2.GaussianBlur(lr, ksize, sigma_cells * 4) / np.maximum(wide_w, 1e-6)
+            sm = np.where(wgt > 0.05, sm, np.where(wide_w > 1e-4, wide, 0.0))
+            fields[k][..., c] = np.exp(sm)
+    return np.clip(fields, *clamp).astype(np.float32)

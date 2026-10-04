@@ -487,3 +487,27 @@ def test_sky_above_the_parapet_is_transparent(tmp_path):
     body = rgba[150:, :, 3]
     assert (top == 0).mean() > 0.95, (top == 0).mean()
     assert (body > 0).mean() > 0.97
+
+
+def _blotchiness(rgba, gsd_m):
+    """Low-frequency brightness error: what reads as blotches on plain wall."""
+    h, w = rgba.shape[:2]
+    truth = syn.truth_image(gsd_m, w, h)[..., ::-1].mean(-1)
+    got = rgba[..., :3].astype(np.float64).mean(-1)
+    ok = rgba[..., 3] > 0
+    scale = (truth[ok] * got[ok]).sum() / (got[ok] ** 2).sum()
+    ratio = np.where(ok, got * scale / np.maximum(truth, 1), 1.0)
+    k = int(0.5 / gsd_m) | 1                          # 0.5 m blur: blotch scale, not texture
+    lf = cv2.GaussianBlur(ratio.astype(np.float32), (k, k), 0)
+    m = k // 2
+    return float(np.std(lf[m:-m, m:-m]))
+
+
+def test_local_gains_remove_blotches(tmp_path):
+    root = tmp_path / "odm"
+    syn.build_project(root, shading=True)
+    _, off = _run(root, tmp_path / "off", gsd_mm=10, options={"local_gains": False})
+    _, on = _run(root, tmp_path / "on", gsd_mm=10)
+    b_off, b_on = _blotchiness(off, 0.01), _blotchiness(on, 0.01)
+    assert b_on < 0.6 * b_off, (b_off, b_on)
+    assert b_on < 0.04, b_on

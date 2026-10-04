@@ -23,6 +23,7 @@ import numpy as np
 
 from .depth import DepthMap
 from .geometry import OrthoGrid
+from .images import remap
 from .selection import score_views
 
 
@@ -91,9 +92,9 @@ def refine_depth(plane, depth: DepthMap, shots, zbuffers, gains, cache, sel, cfg
             px, py, d = shot.project(plane.to_world(uu, vv, bb + off))
             inside = np.isfinite(px) & (d > 0) & (px >= 0) & (py >= 0) & (px <= shot.size()[0] - 1) \
                 & (py <= shot.size()[1] - 1)
-            mx = np.where(inside, (px + 0.5) / f - 0.5, -1).astype(np.float32).reshape(1, -1)
-            my = np.where(inside, (py + 0.5) / f - 0.5, -1).astype(np.float32).reshape(1, -1)
-            val = cv2.remap(img, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).ravel()
+            mx = np.where(inside, (px + 0.5) / f - 0.5, -1).astype(np.float32)
+            my = np.where(inside, (py + 0.5) / f - 0.5, -1).astype(np.float32)
+            val = remap(img, mx, my, cv2.INTER_LINEAR)
             val = np.where(inside, val, 0.0).astype(np.float32)
             wgt = inside.astype(np.float32)
             s1[j][m] += val * wgt
