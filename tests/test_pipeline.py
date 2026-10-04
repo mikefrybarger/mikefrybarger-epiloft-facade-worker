@@ -511,3 +511,23 @@ def test_local_gains_remove_blotches(tmp_path):
     b_off, b_on = _blotchiness(off, 0.01), _blotchiness(on, 0.01)
     assert b_on < 0.6 * b_off, (b_off, b_on)
     assert b_on < 0.04, b_on
+
+
+def test_stepped_storefront_with_glass_does_not_wobble(tmp_path, monkeypatch):
+    """Real storefront shape: glass line set back under a band, sparse shop
+    interior through the glass, reflections that differ per photo. The single
+    plane + protrusions model called half of this "structure" and per-patch
+    corrections jittered on the glass (melting storefront bottoms)."""
+    monkeypatch.setitem(syn.STOREFRONT, "enabled", True)
+    root = tmp_path / "odm"
+    syn.build_project(root)
+    sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5)
+    d = sidecar["depth"]
+    offsets = sorted(l["offset_m"] for l in d["layers"])
+    assert any(abs(o) < 0.03 for o in offsets) and any(abs(o - syn.STORE_W) < 0.03 for o in offsets), d
+    assert d["structure_fraction"] < 0.15, d
+    ref = sidecar["diagnostics"]["refine"]
+    assert ref["segment_offset_spread_m"] < 0.02, ref
+    psnr, shift = _compare(rgba, 0.005)
+    assert psnr > 27, psnr
+    assert abs(shift[0]) < 0.5 and abs(shift[1]) < 0.5, shift

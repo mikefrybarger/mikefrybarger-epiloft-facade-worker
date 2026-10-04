@@ -34,10 +34,10 @@ class RefineConfig:
     search_m: float = 0.15        # +- sweep around the cloud depth
     step_m: float = 0.0075
     top_k: int = 4                # photos compared per patch
-    window_cells: int = 5         # cost aggregation window (5 x 3 cm = 15 cm)
-    min_confidence: float = 0.25  # relative cost drop needed to trust a patch's own depth
     prior_weight: float = 0.35    # pull toward the wall-wide offset (repeating patterns, siding)
-    max_local_m: float = 0.08     # a patch may differ from the wall-wide offset by at most this
+    max_local_m: float = 0.08     # a region may differ from the wall-wide offset by at most this
+    min_segment_cells: int = 40   # regions smaller than this take the wall-wide offset
+    min_segment_drop: float = 0.02  # relative cost drop a region needs to get its own offset
 
 
 def _gray(img: np.ndarray) -> np.ndarray:
@@ -104,70 +104,66 @@ def refine_depth(plane, depth: DepthMap, shots, zbuffers, gains, cache, sel, cfg
 
     enough = cnt >= 2
     var = np.where(enough, s2 / np.maximum(cnt, 1) - (s1 / np.maximum(cnt, 1)) ** 2, np.nan)
-    del s1, s2
-    # aggregate over a small window (NaN-aware box filter)
-    win = (cfg.window_cells, cfg.window_cells)
-    cost = np.empty_like(var)
-    for j in range(D):
-        vj = var[j]
-        ok = np.isfinite(vj).astype(np.float32)
-        num = cv2.boxFilter(np.where(np.isfinite(vj), vj, 0).astype(np.float32), -1, win, normalize=False)
-        den = cv2.boxFilter(ok, -1, win, normalize=False)
-        cost[j] = np.where(den >= 0.6 * win[0] * win[1], num / np.maximum(den, 1e-6), np.nan)
+    del s1, s2, cnt
+    full = np.all(np.isfinite(var), axis=0) & valid
+    if full.sum() < 50:
+        return depth, {"status": "no_overlap", "cells": int(full.sum())}
+    # per cell, cost relative to that cell's average over the sweep (1.0 = no preference)
+    norm = var / np.maximum(np.nanmean(var, axis=0), 1e-3)[None]
     del var
-    full = np.all(np.isfinite(cost), axis=0)
-    cmean = np.nanmean(np.where(full[None], cost, np.nan), axis=0)
-    norm = cost / np.maximum(cmean, 1e-3)[None]           # 1.0 = no better than average
 
-    def pick(c):
-        ci = np.argmin(np.where(np.isfinite(c), c, np.inf), axis=0)
-        i0 = np.clip(ci, 1, D - 2)
-        cz = np.nan_to_num(c, nan=0.0)
-        c_l = np.take_along_axis(cz, (i0 - 1)[None], axis=0)[0]
-        c_c = np.take_along_axis(cz, i0[None], axis=0)[0]
-        c_r = np.take_along_axis(cz, (i0 + 1)[None], axis=0)[0]
-        den = c_l - 2 * c_c + c_r
-        frac = np.where(np.abs(den) > 1e-6, 0.5 * (c_l - c_r) / den, 0.0).clip(-0.5, 0.5)
-        cmin = np.take_along_axis(np.nan_to_num(c, nan=np.inf), ci[None], axis=0)[0]
-        return offsets[i0] + frac * cfg.step_m, ci, cmin
+    # One correction per region (a facade layer piece, a sign, a column), from
+    # every cell in it. Patch-by-patch corrections jitter on glass, whose
+    # reflections differ in every photo; a whole region cannot wobble.
+    seg = depth.segment_at(u, v)
+    seg = np.where(seg >= 0, seg, seg.max() + 1 if seg.size else 0)
+    nseg = int(seg.max()) + 1
+    sf = seg[full]
+    sums = np.stack([np.bincount(sf, weights=norm[j][full], minlength=nseg) for j in range(D)])  # (D, S)
+    ncell = np.bincount(sf, minlength=nseg).astype(np.float64)
+    seg_cost = sums / np.maximum(ncell, 1)[None]
+    wall_cost = sums.sum(axis=1) / max(ncell.sum(), 1)
 
-    # pass 1: the wall-wide offset, from clearly textured patches
-    best0, ci0, cmin0 = pick(norm)
-    conf0 = np.where(full, 1.0 - cmin0, 0.0)
-    edge0 = (ci0 == 0) | (ci0 == D - 1)
-    strong = full & (conf0 >= cfg.min_confidence) & ~edge0
-    if strong.sum() < 20:
-        return depth, {"status": "no_texture", "confident_fraction": round(float(strong.mean()), 4)}
-    global_off = float(np.median(best0[strong]))
-    # pass 2: per patch, with a pull toward the wall-wide offset so a repeating
-    # pattern (stripes, siding) cannot lock onto a false match one period away
-    pen = cfg.prior_weight * ((offsets - global_off) / cfg.search_m) ** 2
-    best, ci, cmin = pick(norm + pen[:, None, None])
-    conf = np.where(full, 1.0 - np.take_along_axis(np.nan_to_num(norm, nan=1.0), ci[None], axis=0)[0], 0.0)
-    edge = (ci == 0) | (ci == D - 1)
-    confident = full & (conf >= cfg.min_confidence) & ~edge
-    best = np.clip(best, global_off - cfg.max_local_m, global_off + cfg.max_local_m)
-    del cost, norm
+    def parabola(c, i):
+        i0 = int(np.clip(i, 1, D - 2))
+        den = c[i0 - 1] - 2 * c[i0] + c[i0 + 1]
+        frac = 0.5 * (c[i0 - 1] - c[i0 + 1]) / den if abs(den) > 1e-9 else 0.0
+        return float(offsets[i0] + np.clip(frac, -0.5, 0.5) * cfg.step_m)
 
-    if confident.sum() < 20:
-        return depth, {"status": "no_texture", "confident_fraction": round(float(confident.mean()), 4)}
-    dw = np.where(confident, best, global_off).astype(np.float32)
-    if min(H, W) >= 5:
-        dw = cv2.medianBlur(dw, 5)
+    gi = int(np.argmin(wall_cost))
+    global_off = parabola(wall_cost, gi)
+    global_drop = float(np.mean(wall_cost) - wall_cost[gi])
+    pen = cfg.prior_weight * 0.1 * ((offsets - global_off) / cfg.search_m) ** 2
+    dw_seg = np.full(nseg, global_off)
+    refined_segments = 0
+    for k in range(nseg):
+        if ncell[k] < cfg.min_segment_cells:
+            continue
+        c = seg_cost[:, k] + pen
+        i = int(np.argmin(c))
+        drop = float(np.mean(seg_cost[:, k]) - seg_cost[i, k])
+        if i in (0, D - 1) or drop < cfg.min_segment_drop:
+            continue
+        dw_seg[k] = np.clip(parabola(c, i), global_off - cfg.max_local_m, global_off + cfg.max_local_m)
+        refined_segments += 1
+    dw = dw_seg[seg].astype(np.float32)
     new_grid = (base + dw).astype(np.float32)
     lo, hi = float(depth.grid.min()) - cfg.search_m, float(depth.grid.max()) + cfg.search_m
     new_grid = np.clip(new_grid, lo, hi)
+    big = ncell >= cfg.min_segment_cells
     info = {
         "status": "ok",
         "global_offset_m": round(global_off, 4),
-        "confident_fraction": round(float(confident.mean()), 4),
-        "local_residual_std_m": round(float(np.std(best[confident] - global_off)), 4),
+        "global_cost_drop": round(global_drop, 4),
+        "segments": nseg,
+        "segments_refined": refined_segments,
+        "segment_offset_spread_m": round(float(np.std(dw_seg[big] - global_off)) if big.any() else 0.0, 4),
         "image_level": level,
         "photos": n,
     }
     if log:
-        log(f"Photo-consistency depth: global offset {global_off * 100:.1f} cm, "
-            f"{confident.mean():.0%} of the wall textured enough to refine locally")
+        log(f"Photo-consistency depth: wall offset {global_off * 100:.1f} cm, "
+            f"{refined_segments} of {nseg} regions corrected individually")
     refined = DepthMap(cell_m=cfg.cell_m, height_m=depth.height_m, grid=new_grid,
                        coverage=depth.coverage, point_count=depth.point_count,
                        source=depth.source + " + photo consistency",
