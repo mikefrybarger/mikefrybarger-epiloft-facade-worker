@@ -6,12 +6,20 @@ wall. Seen from photos 5 m away at different angles, a 9 cm depth error
 shifts detail by several centimetres between photos, which is exactly the
 doubled sign lettering in the output.
 
-So for each patch of wall, the depth is swept a little forward and back,
-every good photo of that patch is sampled at each trial depth, and the depth
-where they agree best (lowest colour variance, aggregated over a small
-window) wins. Confident patches (texture, lettering, frames) get their own
-correction; flat paint, where any depth looks the same, takes the wall-wide
-median correction, so a global cloud/pose offset is removed everywhere.
+So the depth is swept a little forward and back, every good photo is
+sampled at each trial depth, and the depth where they agree best (lowest
+colour variance) wins. What is allowed to move is structural, not local:
+
+* The whole wall gets one correction line (an offset plus a small drift
+  along it): a cloud/pose mismatch is a rigid error, not a per-patch one.
+* Each facade layer (glass line, stucco band, sign band) may differ from
+  that line by a few cm, as one piece along its whole length. Its fragments
+  never get separate corrections: that is what put steps into window
+  bottoms where one pane's depth met the next one's.
+* A structure face (a sign, a column) may differ from the layer it stands
+  on by a few cm more, as one piece.
+* Only cells whose depth the cloud really measured vote. Glass shows a
+  different reflection in every photo and would pull its region anywhere.
 """
 from __future__ import annotations
 
@@ -35,9 +43,11 @@ class RefineConfig:
     step_m: float = 0.0075
     top_k: int = 4                # photos compared per patch
     prior_weight: float = 0.35    # pull toward the wall-wide offset (repeating patterns, siding)
-    max_local_m: float = 0.08     # a region may differ from the wall-wide offset by at most this
-    min_segment_cells: int = 40   # regions smaller than this take the wall-wide offset
-    min_segment_drop: float = 0.02  # relative cost drop a region needs to get its own offset
+    max_layer_m: float = 0.05     # a facade layer may differ from the wall's correction by at most this
+    max_struct_m: float = 0.04    # a structure face may differ from its layer's correction by at most this
+    max_drift: float = 0.003      # wall correction may drift this much per metre along the wall
+    min_segment_cells: int = 40   # layers / structures smaller than this follow the wall
+    min_segment_drop: float = 0.02  # relative cost drop a piece needs to get its own offset
 
 
 def _gray(img: np.ndarray) -> np.ndarray:
@@ -112,61 +122,139 @@ def refine_depth(plane, depth: DepthMap, shots, zbuffers, gains, cache, sel, cfg
     norm = var / np.maximum(np.nanmean(var, axis=0), 1e-3)[None]
     del var
 
-    # One correction per region (a facade layer piece, a sign, a column), from
-    # every cell in it. Patch-by-patch corrections jitter on glass, whose
-    # reflections differ in every photo; a whole region cannot wobble.
+    # Evidence: measured cells only (glass reflections never vote).
     seg_raw = depth.segment_at(u, v)
-    seg = np.where(seg_raw >= 0, seg_raw, seg_raw.max() + 1 if seg_raw.size else 0)
-    nseg = int(seg.max()) + 1
-    sf = seg[full]
-    sums = np.stack([np.bincount(sf, weights=norm[j][full], minlength=nseg) for j in range(D)])  # (D, S)
-    ncell = np.bincount(sf, minlength=nseg).astype(np.float64)
-    seg_cost = sums / np.maximum(ncell, 1)[None]
-    wall_cost = sums.sum(axis=1) / max(ncell.sum(), 1)
+    measured = depth.measured_at(u, v)
+    use = full & measured
+    if use.sum() < 50:
+        use = full
+    nseg = int(seg_raw.max()) + 1 if (seg_raw.size and seg_raw.max() >= 0) else 1
+    seg = np.where(seg_raw >= 0, seg_raw, 0)
+    if depth.seg_layer is not None and len(depth.seg_layer) == nseg:
+        seg_layer, seg_host = depth.seg_layer, depth.seg_host
+    else:                                   # no layer model: the whole wall is one piece
+        seg_layer = np.zeros(nseg, dtype=np.int32)
+        seg_host = np.zeros(nseg, dtype=np.int32)
+    cell_layer = np.where(seg_raw >= 0, seg_host[seg], 0)          # layer each cell stands on
+    nlayer = int(seg_host.max()) + 1 if len(seg_host) else 1
 
-    def parabola(c, i):
-        i0 = int(np.clip(i, 1, D - 2))
-        den = c[i0 - 1] - 2 * c[i0] + c[i0 + 1]
-        frac = 0.5 * (c[i0 - 1] - c[i0 + 1]) / den if abs(den) > 1e-9 else 0.0
-        return float(offsets[i0] + np.clip(frac, -0.5, 0.5) * cfg.step_m)
+    u_mid = float(np.mean(u[use]))
+    bin_m = 0.5
+    ub = np.clip(((u - u.min()) / bin_m).astype(np.int64), 0, None)
+    nb = int(ub.max()) + 1
+    ucen = (np.arange(nb) + 0.5) * bin_m + float(u.min()) - u_mid
 
-    gi = int(np.argmin(wall_cost))
-    global_off = parabola(wall_cost, gi)
-    global_drop = float(np.mean(wall_cost) - wall_cost[gi])
-    pen = cfg.prior_weight * 0.1 * ((offsets - global_off) / cfg.search_m) ** 2
-    dw_seg = np.full(nseg, global_off)
-    refined_segments = 0
-    for k in range(nseg):
-        if ncell[k] < cfg.min_segment_cells:
-            continue
-        c = seg_cost[:, k] + pen
+    def binned(mask):
+        """(D, nbins) summed cost and (nbins,) cell counts over mask."""
+        b = ub[mask]
+        cs = np.stack([np.bincount(b, weights=norm[j][mask], minlength=nb) for j in range(D)])
+        return cs, np.bincount(b, minlength=nb).astype(np.float64)
+
+    def line_cost(cs, counts, a_vals, b):
+        """Mean cost of the correction line a + b * (u - u_mid) for each a."""
+        tot = np.zeros(len(a_vals))
+        for i in np.flatnonzero(counts):
+            tot += np.interp(a_vals + b * ucen[i], offsets, cs[:, i],
+                             left=cs[0, i] * 2, right=cs[-1, i] * 2)
+        return tot / max(counts.sum(), 1)
+
+    fine = np.arange(offsets[0], offsets[-1] + 1e-9, cfg.step_m / 4)
+
+    # 1) the wall: offset + drift
+    cs_all, n_all = binned(use)
+    span = max(float(np.ptp(u[use])), 1e-6)
+    max_b = min(cfg.max_drift, cfg.search_m / span)
+    best = (np.inf, 0.0, 0.0)
+    for b in np.linspace(-max_b, max_b, 13) if max_b > 1e-6 else [0.0]:
+        c = line_cost(cs_all, n_all, fine, b)
         i = int(np.argmin(c))
-        drop = float(np.mean(seg_cost[:, k]) - seg_cost[i, k])
-        if i in (0, D - 1) or drop < cfg.min_segment_drop:
+        if c[i] < best[0]:
+            best = (float(c[i]), float(fine[i]), float(b))
+    wall_cost = line_cost(cs_all, n_all, offsets, 0.0)
+    _, global_off, drift = best
+    global_drop = float(np.mean(wall_cost) - np.min(wall_cost))
+
+    def wall_line(uu):
+        return global_off + drift * (uu - u_mid)
+
+    pen_scale = cfg.prior_weight * 0.1
+
+    def best_delta(cs, counts, base_b, limit, base_off=0.0):
+        """Offset (relative to the wall line) minimising cost, or None if not confident."""
+        deltas = np.arange(-limit, limit + 1e-9, cfg.step_m / 4)
+        c = line_cost(cs, counts, global_off + base_off + deltas, base_b)
+        flat = line_cost(cs, counts, offsets, 0.0)
+        c = c + pen_scale * ((base_off + deltas) / cfg.search_m) ** 2
+        i = int(np.argmin(c))
+        drop = float(np.mean(flat) - c[i])
+        at_limit = i in (0, len(deltas) - 1)
+        if drop < cfg.min_segment_drop * (2.0 if at_limit else 1.0):
+            return None
+        return float(deltas[i])
+
+    # 2) each layer, as one piece
+    layer_delta = np.zeros(nlayer)
+    layer_refined = 0
+    for k in range(nlayer):
+        mk = use & (cell_layer == k) & (np.where(seg_raw >= 0, seg_layer[seg], 0) >= 0)
+        if mk.sum() < cfg.min_segment_cells:
             continue
-        dw_seg[k] = np.clip(parabola(c, i), global_off - cfg.max_local_m, global_off + cfg.max_local_m)
-        refined_segments += 1
-    dw = dw_seg[seg].astype(np.float32)
-    new_grid = (base + dw).astype(np.float32)
+        cs, cn = binned(mk)
+        d = best_delta(cs, cn, drift, cfg.max_layer_m)
+        if d is not None:
+            layer_delta[k] = d
+            layer_refined += 1
+
+    # 3) each structure face, as one piece, relative to the layer it stands on
+    dseg = layer_delta[seg_host].copy()
+    struct_refined = 0
+    for k in np.flatnonzero(seg_layer < 0):
+        mk = use & (seg_raw == k)
+        if mk.sum() < cfg.min_segment_cells:
+            continue
+        cs, cn = binned(mk)
+        d = best_delta(cs, cn, drift, cfg.max_struct_m, base_off=layer_delta[seg_host[k]])
+        if d is not None:
+            dseg[k] = layer_delta[seg_host[k]] + d
+            struct_refined += 1
+
+    # Apply on the depth model's own raster (1 cm), so its straight, sharp
+    # steps stay exactly where they are: every piece moves as a whole.
+    rows_d, cols_d = depth.grid.shape
+    ud = ((np.arange(cols_d) + 0.5) * depth.cell_m)[None, :]
+    if depth.segments is not None:
+        sd = depth.segments
+        piece = np.where(sd >= 0, dseg[np.clip(sd, 0, nseg - 1)], 0.0)
+    else:
+        piece = 0.0
+    new_grid = (depth.grid + wall_line(ud) + piece).astype(np.float32)
     lo, hi = float(depth.grid.min()) - cfg.search_m, float(depth.grid.max()) + cfg.search_m
     new_grid = np.clip(new_grid, lo, hi)
-    big = ncell >= cfg.min_segment_cells
+    present = np.bincount(seg[seg_raw >= 0], minlength=nseg) >= cfg.min_segment_cells
     info = {
         "status": "ok",
         "global_offset_m": round(global_off, 4),
+        "drift_mm_per_m": round(drift * 1000, 2),
         "global_cost_drop": round(global_drop, 4),
         "segments": nseg,
-        "segments_refined": refined_segments,
-        "segment_offset_spread_m": round(float(np.std(dw_seg[big] - global_off)) if big.any() else 0.0, 4),
+        "layers_refined": layer_refined,
+        "layer_offsets_m": [round(float(x), 4) for x in layer_delta],
+        "structures_refined": struct_refined,
+        "segments_refined": layer_refined + struct_refined,
+        "segment_offset_spread_m": round(float(np.std(dseg[present])) if present.any() else 0.0, 4),
+        "evidence_cells": int(use.sum()),
+        "glass_cells_ignored": int((full & ~measured).sum()),
         "image_level": level,
         "photos": n,
     }
     if log:
-        log(f"Photo-consistency depth: wall offset {global_off * 100:.1f} cm, "
-            f"{refined_segments} of {nseg} regions corrected individually")
-    refined = DepthMap(cell_m=cfg.cell_m, height_m=depth.height_m, grid=new_grid,
+        log(f"Photo-consistency depth: wall offset {global_off * 100:.1f} cm, drift {drift * 1000:.1f} mm/m, "
+            f"{layer_refined} layers and {struct_refined} structures corrected as whole pieces")
+    refined = DepthMap(cell_m=depth.cell_m, height_m=depth.height_m, grid=new_grid,
                        coverage=depth.coverage, point_count=depth.point_count,
                        source=depth.source + " + photo consistency",
-                       valid=valid, info={**depth.info, "refine": info})
-    refined.segments = seg_raw.astype(np.int32) if depth.segments is not None else None
+                       valid=depth.valid, info={**depth.info, "refine": info})
+    refined.segments = depth.segments
+    refined.seg_layer, refined.seg_host = depth.seg_layer, depth.seg_host
+    refined.measured = depth.measured
     return refined, info

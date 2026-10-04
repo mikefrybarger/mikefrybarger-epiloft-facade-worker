@@ -14,12 +14,18 @@ So, like the local-alignment step of professional orthomosaic tools:
    Photos shot from different angles err in different directions, so the
    median sits near the truth.
 3. Dense optical flow (DIS) from each photo to the consensus gives how far
-   that photo's detail is off. It is trusted only where there is texture,
-   smoothed over ~0.25 m and capped, so flat paint cannot invent motion.
-4. Two rounds: the consensus is rebuilt from the aligned photos and the flow
+   that photo's detail is off. It is trusted only where there is texture.
+4. The flow is split in two. A broad part, smoothed over ~1 m and capped at
+   8 cm, absorbs what a photo's pose gets wrong (it moves the whole photo,
+   or tilts it, and cannot bend a line). A local part, smoothed over ~0.25 m,
+   is only a residual: capped at 3 cm, so it can close a seam but never
+   melt a sill. Alignment corrects; the depth model defines the architecture.
+5. Two rounds: the consensus is rebuilt from the aligned photos and the flow
    refined.
 
 The result is a smooth warp per photo, applied when the facade is rendered.
+Caps are on the length of the shift, not per axis (8 cm per axis allowed
+11.3 cm diagonally, which is what v.3 reported on Ascend Plaza).
 """
 from __future__ import annotations
 
@@ -40,8 +46,10 @@ LUMA = np.array([0.114, 0.587, 0.299])
 class AlignConfig:
     enabled: bool = True
     res_m: float = 0.01          # alignment grid
-    max_shift_m: float = 0.08    # cap on any correction
-    smooth_m: float = 0.25       # corrections vary over at least this distance
+    max_shift_m: float = 0.08    # cap on the broad (per-photo, pose-like) correction
+    broad_m: float = 1.0         # the broad correction varies over at least this distance
+    max_local_m: float = 0.03    # cap on the local residual on top of it
+    smooth_m: float = 0.25       # the local residual varies over at least this distance
     iterations: int = 2
     min_texture: float = 6.0     # gradient magnitude (grey levels/px) to trust flow
 
@@ -87,17 +95,22 @@ def _render(shot, plane, depth, zb, cache, gain_luma, grid, rows, cols, native_g
     return np.clip(out, 0, 255).astype(np.uint8), vis
 
 
+def _cap(flow, cap_px):
+    """Limit the length of each shift vector (not each axis)."""
+    mag = np.hypot(flow[..., 0], flow[..., 1])
+    scale = np.where(mag > cap_px, cap_px / np.maximum(mag, 1e-6), 1.0)
+    return (flow * scale[..., None]).astype(np.float32)
+
+
 def _smooth_flow(flow, weight, sigma_px, cap_px):
     out = np.zeros_like(flow)
     wsum = cv2.GaussianBlur(weight, (0, 0), sigma_px)
     for c in range(2):
         num = cv2.GaussianBlur(flow[..., c] * weight, (0, 0), sigma_px)
         out[..., c] = np.where(wsum > 1e-3, num / np.maximum(wsum, 1e-6), 0.0)
-    mag = np.hypot(out[..., 0], out[..., 1])
-    scale = np.where(mag > cap_px, cap_px / np.maximum(mag, 1e-6), 1.0)
     # fade to zero where there is no evidence at all
     conf = np.clip(wsum / 0.05, 0, 1)
-    return (out * (scale * conf)[..., None]).astype(np.float32)
+    return _cap(out * conf[..., None], cap_px)
 
 
 def align_photos(plane, depth, shots, zbuffers, gains, cache, valid_coarse, coarse_cell,
@@ -108,7 +121,7 @@ def align_photos(plane, depth, shots, zbuffers, gains, cache, valid_coarse, coar
     grid = OrthoGrid.for_plane(plane, cfg.res_m)
     H, W = grid.height_px, grid.width_px
     scale = coarse_cell / cfg.res_m
-    pad = int(math.ceil(cfg.max_shift_m / cfg.res_m)) + 8
+    pad = int(math.ceil((cfg.max_shift_m + cfg.max_local_m) / cfg.res_m)) + 8
 
     # each photo's footprint on the alignment grid, from the coarse visibility
     boxes = []
@@ -132,10 +145,14 @@ def align_photos(plane, depth, shots, zbuffers, gains, cache, valid_coarse, coar
         orthos[k], masks[k] = _render(shot, plane, depth, zbuffers[shot.name], cache, g, grid,
                                       (r0, r1), (c0, c1), native_gsd_m)
 
+    broad = {k: np.zeros(orthos[k].shape + (2,), np.float32) for k in orthos}
+    local = {k: np.zeros(orthos[k].shape + (2,), np.float32) for k in orthos}
     flows = {k: np.zeros(orthos[k].shape + (2,), np.float32) for k in orthos}
     dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
     sigma = cfg.smooth_m / cfg.res_m
+    sigma_b = max(cfg.broad_m, cfg.smooth_m) / cfg.res_m
     cap = cfg.max_shift_m / cfg.res_m
+    cap_l = cfg.max_local_m / cfg.res_m
     stats = []
     for it in range(cfg.iterations):
         aligned, amask = {}, {}
@@ -190,8 +207,11 @@ def align_photos(plane, depth, shots, zbuffers, gains, cache, valid_coarse, coar
             tgt = np.where(ok, ref, src)
             f = dis.calc(tgt, src, None)                          # tgt(p) ~ src(p + f)
             wgt = (ok & (texture[r0:r1, c0:c1] > cfg.min_texture)).astype(np.float32)
-            inc = _smooth_flow(f, wgt, sigma, cap)
-            flows[k] = np.clip(flows[k] + inc, -cap, cap)
+            inc_b = _smooth_flow(f, wgt, sigma_b, cap)
+            inc_l = _smooth_flow(f - inc_b, wgt, sigma, cap_l)
+            broad[k] = _cap(broad[k] + inc_b, cap)
+            local[k] = _cap(local[k] + inc_l, cap_l)
+            flows[k] = broad[k] + local[k]
             mag = np.hypot(flows[k][..., 0], flows[k][..., 1])[masks[k]]
             moved.append(float(np.percentile(mag, 90)) if mag.size else 0.0)
         stats.append(round(float(np.median(moved)) * cfg.res_m, 4) if moved else 0.0)
@@ -199,29 +219,40 @@ def align_photos(plane, depth, shots, zbuffers, gains, cache, valid_coarse, coar
     # the warp is smooth over smooth_m, so it is stored at a quarter of the
     # alignment resolution (memory: dozens of photos over a long wall)
     fields = {}
-    shifts = []
+    shifts, broad_p90, local_p90 = [], [], []
     store = max(1, int(round(sigma / 4)))
     for k in orthos:
         r0, r1, c0, c1 = boxes[k]
         m = np.hypot(flows[k][..., 0], flows[k][..., 1])[masks[k]]
         if m.size:
             shifts.append(float(np.percentile(m, 90)) * cfg.res_m)
+            broad_p90.append(float(np.percentile(np.hypot(*np.moveaxis(broad[k], -1, 0))[masks[k]], 90))
+                             * cfg.res_m)
+            local_p90.append(float(np.percentile(np.hypot(*np.moveaxis(local[k], -1, 0))[masks[k]], 90))
+                             * cfg.res_m)
         fh, fw = flows[k].shape[:2]
         sh, sw = max(1, -(-fh // store)), max(1, -(-fw // store))
         padded = np.zeros((sh * store, sw * store, 2), np.float32)
         padded[:fh, :fw] = flows[k]
         small = padded.reshape(sh, store, sw, store, 2).mean(axis=(1, 3)).astype(np.float32)
         fields[shots[k].name] = (r0, c0, store, small)
-        del flows[k]
+        del flows[k], broad[k], local[k]
     report = {
         "status": "ok",
         "photos": len(fields),
         "p90_shift_m_median": round(float(np.median(shifts)), 4) if shifts else 0.0,
         "p90_shift_m_max": round(float(np.max(shifts)), 4) if shifts else 0.0,
+        # broad = pose-like (whole photo); local = bends within a photo. A large
+        # broad part means pose error; a large local part means the depth model
+        # is still wrong somewhere.
+        "broad_p90_m_median": round(float(np.median(broad_p90)), 4) if broad_p90 else 0.0,
+        "local_p90_m_median": round(float(np.median(local_p90)), 4) if local_p90 else 0.0,
+        "local_p90_m_max": round(float(np.max(local_p90)), 4) if local_p90 else 0.0,
         "per_iteration_m": stats,
         "grid_mm": round(cfg.res_m * 1000, 1),
     }
     if log:
-        log(f"Photo alignment: typical correction {report['p90_shift_m_median'] * 100:.1f} cm, "
+        log(f"Photo alignment: typical correction {report['p90_shift_m_median'] * 100:.1f} cm "
+            f"(broad {report['broad_p90_m_median'] * 100:.1f} cm, local {report['local_p90_m_median'] * 100:.1f} cm), "
             f"largest {report['p90_shift_m_max'] * 100:.1f} cm")
     return AlignmentField(grid, fields), report

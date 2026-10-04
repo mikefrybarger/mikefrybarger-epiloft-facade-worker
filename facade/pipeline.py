@@ -67,13 +67,16 @@ class FacadeOptions:
                     "occlusion_abs_tol_m": "abs_tol_m", "occlusion_rel_tol": "rel_tol"}
         vis = VisibilityConfig(**{vis_keys[k]: data.pop(k) for k in list(data) if k in vis_keys})
         ref_keys = {"refine_depth": "enabled", "refine_cell_mm": "cell_m", "refine_search_m": "search_m",
-                    "refine_top_k": "top_k", "refine_min_segment_drop": "min_segment_drop"}
+                    "refine_top_k": "top_k", "refine_min_segment_drop": "min_segment_drop",
+                    "refine_max_layer_m": "max_layer_m", "refine_max_struct_m": "max_struct_m",
+                    "refine_max_drift": "max_drift"}
         ref_args = {ref_keys[k]: data.pop(k) for k in list(data) if k in ref_keys}
         if "cell_m" in ref_args:
             ref_args["cell_m"] = float(ref_args["cell_m"]) / 1000.0
         ref = RefineConfig(**ref_args)
         al_keys = {"align_photos": "enabled", "align_res_mm": "res_m", "align_max_shift_m": "max_shift_m",
-                   "align_smooth_m": "smooth_m", "align_iterations": "iterations"}
+                   "align_smooth_m": "smooth_m", "align_iterations": "iterations",
+                   "align_max_local_m": "max_local_m", "align_broad_m": "broad_m"}
         al_args = {al_keys[k]: data.pop(k) for k in list(data) if k in al_keys}
         if "res_m" in al_args:
             al_args["res_m"] = float(al_args["res_m"]) / 1000.0

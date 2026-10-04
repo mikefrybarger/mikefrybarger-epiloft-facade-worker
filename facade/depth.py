@@ -29,6 +29,8 @@ import cv2
 import numpy as np
 
 from .images import remap
+from .structure import (paint_lines_fine, refine_lines_with_points, straighten_boundaries,
+                        structure_planes)
 
 GROUND_BAND_M = 0.35      # bottom of the wall where points in front are taken as ground
 GROUND_FRONT_M = 0.06
@@ -50,6 +52,18 @@ class DepthMap:
     valid: np.ndarray | None = None     # (rows, cols) bool; False = no surface (sky)
     info: dict = field(default_factory=dict)
     segments: np.ndarray | None = None  # (rows, cols) int32 region ids (-1 none)
+    # per segment: its facade layer (>= 0), or -1 for a structure face
+    seg_layer: np.ndarray | None = None
+    # per segment: the layer a structure stands on (its own layer for layer pieces)
+    seg_host: np.ndarray | None = None
+    measured: np.ndarray | None = None  # (rows, cols) bool: depth really measured here (not glass/gap)
+
+    def measured_at(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        if self.measured is None:
+            return np.ones(np.shape(u), dtype=bool)
+        mx, my, shape = self._maps(u, v)
+        out = remap(self.measured.astype(np.uint8), mx, my, cv2.INTER_NEAREST)
+        return out.astype(bool).reshape(shape)
 
     def segment_at(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
         if self.segments is None:
@@ -335,50 +349,138 @@ def build_depth_map(wall_pts: np.ndarray, width_m: float, height_m: float, *,
         label = _fill_holes_by_majority(label, known, nlab, int(MAX_HOLE_M2 / (cell_m * cell_m)))
         label = fill_nearest(label, label >= 0)
         # tidy layer labels: majority vote so layers form regions, not speckle
-        # straight-ish boundaries: facade layer edges run along sills and bands
         win = max(7, int(round(0.22 / cell_m)) | 1)
         for _ in range(3):
             votes = np.stack([cv2.boxFilter((label == k).astype(np.float32), -1, (win, win), normalize=False)
                               for k in range(nlab)])
             label = np.argmax(votes, axis=0)
-        grid = np.take_along_axis(planes, label[None], axis=0)[0]
-        own = fill_nearest(np.where(reliable, raw, 0.0), reliable)
-        if min(rows, cols) >= 5:
-            own = cv2.medianBlur(own.astype(np.float32), 5)
-        grid = np.where(structure, own, grid)
 
-        # regions: connected pieces of each layer, and each structure
-        segments = np.full((rows, cols), -1, dtype=np.int32)
-        next_id = 0
-        for k in range(nlab):
-            n, lab = cv2.connectedComponents(((label == k) & ~structure).astype(np.uint8), connectivity=4)
-            segments = np.where(lab > 0, lab - 1 + next_id, segments)
-            next_id += n - 1
-        n, lab = cv2.connectedComponents(structure.astype(np.uint8), connectivity=8)
-        segments = np.where(lab > 0, lab - 1 + next_id, segments).astype(np.int32)
-        next_id += n - 1
+        # Buildings are straight: the cloud's wandering edges (sill, band over
+        # the storefront, sign box) become straight lines, structures included
+        # (class nlab), so the depth never switches surface along a wavy line.
+        comb = np.where(structure, nlab, label)
+        comb, lines, straight = straighten_boundaries(comb, cell_m)
+        lines = refine_lines_with_points(lines, u, v, w, layers, nlab, cell_m, height_m)
+        structure = comb == nlab
+        label = np.where(structure, label, comb)
+        info.update(straight)
+        info["line_shift_mm_median"] = round(float(np.median(np.abs(
+            [ln["shift_m"] for ln in lines] or [0.0]))) * 1000, 1)
+        # each structure is one plane per face, never cell-by-cell cloud depth:
+        # a sign, column or frame is flat, and its noisy cloud must not bend it
+        faces, face_coef = structure_planes(structure, raw, reliable, uc, vc, cell_m)
+        nfaces = len(face_coef)
         info.update({
             "layers": [_layer_info(c, (label == k) & ~structure, uc, vc) for k, c in enumerate(layers)],
             "structure_fraction": round(float(structure.mean()), 4),
-            "segments": int(next_id),
+            "structure_faces": int(nfaces),
             "obstacle_cells_ignored": int(((dev_s > 0.45) & wall_behind & ~proud).sum()),
         })
+        sky = _sky(filled, cell_m, info)
+        return _assemble(comb, label, faces, layers, face_coef, lines, nlab, sky, reliable,
+                         cell_m, height_m, depth_front_m, depth_back_m, coverage, int(len(w)), source, info)
     else:
         grid = fill_nearest(np.where(filled, raw, 0.0), filled)
         if min(rows, cols) >= 5:
             grid = cv2.medianBlur(grid.astype(np.float32), 5)
 
-    sky = sky_mask(filled, max(3, int(round(0.3 / cell_m))))
-    info["sky_fraction"] = round(float(sky.mean()), 4)
-    if sky.any():  # trim the ragged fringe where the parapet meets the sky
-        k = max(1, int(round(0.04 / cell_m)))
-        sky = cv2.dilate(sky.astype(np.uint8), np.ones((2 * k + 1, 2 * k + 1), np.uint8)).astype(bool)
+    sky = _sky(filled, cell_m, info)
     # The surface can only be inside the search band; never let filtering
     # or filling put it anywhere else.
     grid = np.clip(grid, -depth_back_m, depth_front_m).astype(np.float32)
     dm = DepthMap(cell_m=cell_m, height_m=height_m, grid=grid, coverage=coverage,
                   point_count=int(len(w)), source=source, valid=~sky, info=info)
     dm.segments = segments
+    dm.measured = reliable
+    return dm
+
+
+def _sky(filled, cell_m, info):
+    sky = sky_mask(filled, max(3, int(round(0.3 / cell_m))))
+    info["sky_fraction"] = round(float(sky.mean()), 4)
+    if sky.any():  # trim the ragged fringe where the parapet meets the sky
+        k = max(1, int(round(0.04 / cell_m)))
+        sky = cv2.dilate(sky.astype(np.uint8), np.ones((2 * k + 1, 2 * k + 1), np.uint8)).astype(bool)
+    return sky
+
+
+FINE_CELL_M = 0.01           # the surface is drawn this finely: steps stay steps
+MAX_FINE_CELLS = 24_000_000
+MAX_FINE_SIDE = 30_000       # OpenCV remap limit is 32,767 per side
+
+
+def _assemble(comb, label, faces, layers, face_coef, lines, nlab, sky, reliable, cell_m, height_m,
+              depth_front_m, depth_back_m, coverage, point_count, source, info):
+    """Draw the piecewise-planar model on a fine raster.
+
+    The analysis runs on 3-9 cm cells (what the cloud supports), but the
+    model itself is exact: planes and straight lines. Drawn at that coarse
+    cell, every depth step would sit on a cell edge (up to half a cell off
+    the real sill) and be smeared over a whole cell by interpolation, which
+    in a 30-degree oblique photo moves the sill line by centimetres. Drawn at
+    1 cm, a step is where the cloud says it is, and sharp."""
+    rows, cols = comb.shape
+    f = max(1, int(round(cell_m / FINE_CELL_M)))
+    while f > 1 and (rows * cols * f * f > MAX_FINE_CELLS or max(rows, cols) * f > MAX_FINE_SIDE):
+        f -= 1
+    fine_m = cell_m / f
+
+    def up(a):
+        return np.repeat(np.repeat(a, f, axis=0), f, axis=1) if f > 1 else a.copy()
+
+    comb_f = up(comb.astype(np.int16))
+    paint_lines_fine(comb_f, lines, cell_m, fine_m, height_m)
+    structure_f = comb_f == nlab
+    R, C = comb_f.shape
+    uf = ((np.arange(C) + 0.5) * fine_m)[None, :].astype(np.float32)
+    vf = (height_m - (np.arange(R) + 0.5) * fine_m)[:, None].astype(np.float32)
+
+    grid = np.zeros((R, C), np.float32)
+    for k, c in enumerate(layers):
+        m = comb_f == k
+        grid[m] = np.broadcast_to(c[0] + c[1] * uf + c[2] * vf, (R, C))[m]
+
+    # segments: connected pieces of each layer, then the structure faces
+    segments = np.full((R, C), -1, dtype=np.int32)
+    seg_layer, seg_host = [], []
+    next_id = 0
+    for k in range(nlab):
+        n, lab = cv2.connectedComponents((comb_f == k).astype(np.uint8), connectivity=4)
+        segments[lab > 0] = (lab[lab > 0] - 1 + next_id)
+        next_id += n - 1
+        seg_layer += [k] * (n - 1)
+        seg_host += [k] * (n - 1)
+    nfaces = len(face_coef)
+    if structure_f.any():
+        faces_f = up(faces)
+        if nfaces and ((faces_f < 0) & structure_f).any():
+            faces_f = np.where(structure_f, fill_nearest(faces_f, faces_f >= 0), -1)
+        ok = structure_f & (faces_f >= 0)
+        fc = face_coef[faces_f[ok]] if nfaces else np.zeros((0, 3))
+        uu = np.broadcast_to(uf, (R, C))[ok]
+        vv = np.broadcast_to(vf, (R, C))[ok]
+        grid[ok] = (fc[:, 0] + fc[:, 1] * uu + fc[:, 2] * vv).astype(np.float32)
+        segments[ok] = faces_f[ok] + next_id
+        # host layer of each face: the most common layer just around it (coarse)
+        ring = cv2.dilate(np.where(faces >= 0, faces + 1, 0).astype(np.float32),
+                          np.ones((5, 5), np.uint8)).astype(np.int64)
+        around = (ring > 0) & (faces < 0) & (comb < nlab)
+        votes = np.bincount((ring[around] - 1) * nlab + comb[around], minlength=nfaces * nlab)
+        votes = votes.reshape(nfaces, nlab)
+        main = int(np.argmax([(comb == k).sum() for k in range(nlab)]))
+        host = np.where(votes.sum(axis=1) > 0, votes.argmax(axis=1), main)
+        seg_layer += [-1] * nfaces
+        seg_host += host.tolist()
+        next_id += nfaces
+    info["segments"] = int(next_id)
+    info["analysis_cell_mm"] = round(cell_m * 1000, 2)
+    grid = np.clip(grid, -depth_back_m, depth_front_m).astype(np.float32)
+    dm = DepthMap(cell_m=fine_m, height_m=height_m, grid=grid, coverage=coverage, point_count=point_count,
+                  source=source, valid=up(~sky), info=info)
+    dm.segments = segments
+    dm.seg_layer = np.array(seg_layer, dtype=np.int32)
+    dm.seg_host = np.array(seg_host, dtype=np.int32)
+    dm.measured = up(reliable)
     return dm
 
 

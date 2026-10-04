@@ -149,8 +149,29 @@ def write_ply(path: Path, pts: np.ndarray):
 BUILDING_DEPTH = 8.0
 
 
+def boundary_wobble(u, amp):
+    """How far the cloud's band/glass edge wanders from the real (straight) one.
+
+    Photogrammetry smears a depth step over a few cm and the 85th-percentile
+    rasterisation picks up a different side of it cell by cell, so the edge
+    in the cloud is wavy even though the building's is dead straight."""
+    return amp * (0.6 * np.sin(2 * np.pi * u / 0.9) + 0.4 * np.sin(2 * np.pi * u / 0.37 + 1.0))
+
+
+def smart3d_positions():
+    """DJI Smart 3D style: almost every photo looks down at the facade from
+    above at 20-40 degrees, with some yaw, instead of square-on rows."""
+    cams = []
+    for row, (hv, standoff, aim_v) in enumerate(((4.6, 4.5, 1.0), (3.4, 4.0, 1.2))):
+        for i, uu in enumerate(np.linspace(0.4, WALL_W - 0.4, 8)):
+            c = world_wall(uu, hv, standoff + 0.15 * (i % 2))
+            target = world_wall(uu + 0.6 * ((i % 3) - 1), aim_v, 0.0)
+            cams.append((f"S3D_{row}{i:02d}.JPG", c, target))
+    return cams
+
+
 def point_cloud(spacing=0.03, seed=0, post_ring=24, post_step=0.03, ground=False, dropout=0.0,
-                building=False, details=False):
+                building=False, details=False, wobble=0.0):
     rng = np.random.default_rng(seed)
     uu, vv = np.meshgrid(np.arange(0, WALL_W, spacing), np.arange(0, WALL_H, spacing))
     wall = world_wall(uu.ravel(), vv.ravel(), rng.normal(0, 0.004, uu.size))
@@ -167,13 +188,14 @@ def point_cloud(spacing=0.03, seed=0, post_ring=24, post_step=0.03, ground=False
                      ORIGIN[2] + zz.ravel()], -1)
     if STOREFRONT["enabled"]:
         uf, vf = (wall - ORIGIN) @ U, (wall - ORIGIN) @ V
-        low = vf < STORE_V
+        low = vf < STORE_V + boundary_wobble(uf, wobble)
         wall = wall + np.where(low, STORE_W, 0.0)[:, None] * W
         glass = low & in_window(uf, vf)
         keep = ~glass | (rng.random(len(wall)) < 0.06)
         wall = np.where(glass[:, None], wall - 0.6 * W, wall)[keep]     # a few interior points
         su, sw = np.meshgrid(np.arange(0, WALL_W, spacing), np.arange(STORE_W, 0, spacing))
-        wall = np.concatenate([wall, world_wall(su.ravel(), np.full(su.size, STORE_V), sw.ravel())])
+        sv = STORE_V + boundary_wobble(su.ravel(), wobble)
+        wall = np.concatenate([wall, world_wall(su.ravel(), sv, sw.ravel())])
     parts = [wall, post]
     if details:  # sills and mullion frames standing a few cm off the wall
         for vs in (0.9, 2.1):

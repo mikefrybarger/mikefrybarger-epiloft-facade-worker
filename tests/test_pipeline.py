@@ -10,6 +10,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import synthetic as syn  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from handler import produce  # noqa: E402
 
 tifffile = pytest.importorskip("tifffile")
@@ -584,8 +586,15 @@ def test_alignment_fixes_photos_that_disagree(tmp_path):
     al = on["diagnostics"]["align"]
     assert al["status"] == "ok", al
     assert 0.01 < al["p90_shift_m_median"] < 0.08, al
+    # pose errors are whole-photo shifts: the broad part carries them, and no
+    # correction is ever longer than its cap (v.3 allowed 8 cm per axis = 11.3 cm)
+    assert al["broad_p90_m_median"] > al["local_p90_m_median"], al
+    assert al["local_p90_m_max"] <= 0.0301 and al["p90_shift_m_max"] <= 0.1101, al
     assert psnr_on > psnr_off + 3, (psnr_off, psnr_on, al)
-    assert _ghosting(rgba_on, 0.005) > _ghosting(rgba_off, 0.005), "alignment should restore detail"
+    # Doubling smears detail (ratio < 1). Here both runs sit a hair above 1.0
+    # (seam edges), so "on > off" was a coin toss (v.3 passed by 0.0001);
+    # what matters is that alignment keeps the detail of the truth.
+    assert abs(_ghosting(rgba_on, 0.005) - 1.0) < 0.03, _ghosting(rgba_on, 0.005)
 
 
 def test_alignment_leaves_agreeing_photos_alone(project, tmp_path):
@@ -595,3 +604,30 @@ def test_alignment_leaves_agreeing_photos_alone(project, tmp_path):
     assert al["p90_shift_m_max"] < 0.012, al        # nothing to correct, nothing invented
     psnr, _ = _compare(rgba, 0.005)
     assert psnr > 30, psnr
+
+
+def test_wavy_cloud_edge_keeps_sills_straight(tmp_path, monkeypatch):
+    """Ascend Plaza v.3: storefront bottoms and sills came out melted. The
+    cloud's edge between the sill/bulkhead and the glass line above it
+    wanders by several cm (photogrammetry smears every depth step), the depth
+    model switched surface along that wandering line, and Smart 3D's
+    downward-looking photos turned each wiggle into a bent sill. The building
+    is straight: the output must be too."""
+    from straightness import stripe_waviness
+
+    monkeypatch.setitem(syn.STOREFRONT, "enabled", True)
+    monkeypatch.setattr(syn, "STORE_W", 0.15)             # bulkhead / sill zone 15 cm proud of the glass
+    monkeypatch.setattr(syn, "camera_positions", syn.smart3d_positions)
+    root = tmp_path / "odm"
+    syn.build_project(root, cloud={"wobble": 0.08})
+    sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5)
+    d = sidecar["depth"]
+    assert d["straight_lines"]["horizontal"] >= 1, d
+    std, worst = stripe_waviness(rgba, 0.005, 1.87, 1.96)  # the band where the edge is
+    # v.3: 3.5 cm std, 8 cm worst. Straight: what a perfect cloud gives (~0.2 / 1.8).
+    assert std < 0.006 and worst < 0.025, (std, worst)
+    for lo, hi in ((2.29, 2.46), (0.79, 0.96)):          # and nothing else got bent
+        std, worst = stripe_waviness(rgba, 0.005, lo, hi)
+        assert std < 0.004 and worst < 0.012, (lo, std, worst)
+    psnr, _ = _compare(rgba, 0.005)
+    assert psnr > 26, psnr
