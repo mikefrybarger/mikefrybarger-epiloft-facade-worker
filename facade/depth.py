@@ -140,7 +140,9 @@ def fit_wall_plane(depth: np.ndarray, cell_m: float, height_m: float, iters: int
 
 
 def _keep_components(mask: np.ndarray, filled: np.ndarray, min_cells: int, min_fill: float,
-                     wall_behind: np.ndarray | None = None, max_wall_behind: float = 0.35):
+                     wall_behind: np.ndarray | None = None, max_wall_behind: float = 0.35,
+                     dev: np.ndarray | None = None, obstacle_min_dev: float = 0.45,
+                     group_px: int = 0):
     """Connected patches that are big enough and densely measured.
 
     wall_behind: cells where the cloud also has points on the wall plane. A
@@ -151,18 +153,32 @@ def _keep_components(mask: np.ndarray, filled: np.ndarray, min_cells: int, min_f
     All patches are scored in one pass (bincount over the label image), so a
     real facade with thousands of small bumps costs no more than one with two.
     """
-    n, lab, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    m8 = mask.astype(np.uint8)
+    if group_px > 0:
+        # group nearby pieces (the letters of one sign) before judging size
+        k = np.ones((2 * group_px + 1, 2 * group_px + 1), np.uint8)
+        m8 = cv2.morphologyEx(m8, cv2.MORPH_CLOSE, k)
+    n, lab = cv2.connectedComponents(m8, connectivity=8)
     if n <= 1:
         return np.zeros_like(mask)
-    area = stats[:, cv2.CC_STAT_AREA].astype(np.float64)
+    lab = np.where(mask, lab, 0)
     flat = lab.ravel()
+    area = np.bincount(flat, minlength=n).astype(np.float64)
     fill = np.bincount(flat, weights=filled.ravel().astype(np.float64), minlength=n) / np.maximum(area, 1)
     ok = (area >= min_cells) & (fill >= min_fill)
     if wall_behind is not None:
         behind = np.bincount(flat, weights=wall_behind.ravel().astype(np.float64), minlength=n) / np.maximum(area, 1)
-        ok &= behind <= max_wall_behind
+        far = np.ones(n, dtype=bool)
+        if dev is not None:
+            # Only things well off the wall can be free-standing. Channel letters
+            # and frames sit a few cm out with wall visible between them, but
+            # they are mounted on it: they keep their own depth.
+            mean_dev = np.bincount(flat, weights=np.abs(dev).ravel().astype(np.float64),
+                                   minlength=n) / np.maximum(area, 1)
+            far = mean_dev > obstacle_min_dev
+        ok &= ~(far & (behind > max_wall_behind))
     ok[0] = False
-    return ok[lab]
+    return ok[lab] & mask
 
 
 def sky_mask(filled: np.ndarray, closing_cells: int) -> np.ndarray:
@@ -302,7 +318,8 @@ def build_depth_map(wall_pts: np.ndarray, width_m: float, height_m: float, *,
         wall_behind = (np.bincount(flat_idx[on_layer], minlength=rows * cols).reshape(rows, cols) >= 2)
         cell_area = cell_m * cell_m
         proud = _keep_components((dev_s > LAYER_TOL_M) & reliable, reliable,
-                                 int(MIN_STRUCT_AREA_M2 / cell_area), MIN_STRUCT_FILL, wall_behind=wall_behind)
+                                 int(MIN_STRUCT_AREA_M2 / cell_area), MIN_STRUCT_FILL, wall_behind=wall_behind,
+                                 dev=dev_s, group_px=max(1, int(round(0.12 / cell_m))))
         recess = _keep_components((dev_s < -LAYER_TOL_M) & reliable, reliable,
                                   int(MIN_RECESS_AREA_M2 / cell_area), MIN_STRUCT_FILL + 0.15)
         from scipy.ndimage import binary_fill_holes  # noqa: PLC0415
@@ -316,8 +333,10 @@ def build_depth_map(wall_pts: np.ndarray, width_m: float, height_m: float, *,
         label = fill_nearest(label, known)
         nlab = len(layers)
         # tidy layer labels: majority vote so layers form regions, not speckle
-        for _ in range(2):
-            votes = np.stack([cv2.boxFilter((label == k).astype(np.float32), -1, (7, 7), normalize=False)
+        # straight-ish boundaries: facade layer edges run along sills and bands
+        win = max(7, int(round(0.22 / cell_m)) | 1)
+        for _ in range(3):
+            votes = np.stack([cv2.boxFilter((label == k).astype(np.float32), -1, (win, win), normalize=False)
                               for k in range(nlab)])
             label = np.argmax(votes, axis=0)
         grid = np.take_along_axis(planes, label[None], axis=0)[0]
@@ -340,7 +359,7 @@ def build_depth_map(wall_pts: np.ndarray, width_m: float, height_m: float, *,
             "layers": [_layer_info(c, (label == k) & ~structure, uc, vc) for k, c in enumerate(layers)],
             "structure_fraction": round(float(structure.mean()), 4),
             "segments": int(next_id),
-            "obstacle_cells_ignored": int(((dev_s > LAYER_TOL_M) & wall_behind & ~proud).sum()),
+            "obstacle_cells_ignored": int(((dev_s > 0.45) & wall_behind & ~proud).sum()),
         })
     else:
         grid = fill_nearest(np.where(filled, raw, 0.0), filled)

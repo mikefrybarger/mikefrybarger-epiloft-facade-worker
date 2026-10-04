@@ -189,3 +189,26 @@ def test_remap_handles_maps_past_opencvs_size_limit():
     assert out.shape == (n,) and np.array_equal(out, img[ys, xs])
     col = remap(np.dstack([img] * 3), xs.astype(np.float32)[None], ys.astype(np.float32)[None])
     assert col.shape == (1, n, 3) and np.array_equal(col[0, :, 1], img[ys, xs])
+
+
+def test_channel_letters_keep_their_depth():
+    """Channel letters stand ~20 cm off the wall with wall visible between them.
+    They are mounted signage, not free-standing obstacles."""
+    from facade.depth import build_depth_map
+
+    rng = np.random.default_rng(2)
+    n = 300_000
+    u, v = rng.uniform(0, 10, n), rng.uniform(0, 4, n)
+    w = rng.normal(0, 0.004, n)
+    # strokes 15 cm wide with 8 cm gaps, like real channel letters
+    letters = (u > 3) & (u < 7) & (v > 3.0) & (v < 3.6) & (np.mod(u - 3, 0.23) < 0.15)
+    w = np.where(letters, 0.2, w)
+    # wall visible between and, from oblique photos, partly behind the letters
+    gap = (u > 3) & (u < 7) & (v > 3.0) & (v < 3.6)
+    extra_u, extra_v = rng.uniform(3, 7, 30000), rng.uniform(3.0, 3.6, 30000)
+    pts = np.concatenate([np.stack([u, v, w], -1),
+                          np.stack([extra_u, extra_v, np.zeros_like(extra_u)], -1)])
+    d = build_depth_map(pts, 10, 4, cell_m=0.02, depth_front_m=1.2, depth_back_m=1.0)
+    assert gap.any()
+    on_letter = d.sample(np.array([3.075]), np.array([3.3]))[0]
+    assert abs(on_letter - 0.2) < 0.04, on_letter

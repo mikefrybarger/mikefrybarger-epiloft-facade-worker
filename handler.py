@@ -22,7 +22,7 @@ from facade.pipeline import FacadeOptions, run_facade
 from facade.project import load_project, safe_extract
 from facade.transfer import download, refresh_upload_urls, require_http_url, upload
 
-WORKER_VERSION = "2026-10-04.1"
+WORKER_VERSION = "2026-10-04.2"
 GB = 1024 ** 3
 DISK_HEADROOM_FACTOR = 2.5
 
