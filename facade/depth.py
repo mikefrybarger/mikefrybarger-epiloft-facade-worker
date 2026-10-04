@@ -146,18 +146,23 @@ def _keep_components(mask: np.ndarray, filled: np.ndarray, min_cells: int, min_f
     wall_behind: cells where the cloud also has points on the wall plane. A
     free-standing post or pole has wall behind it (oblique photos see past it);
     a sign, column or tower does not (it is solid). Patches with too much wall
-    behind them are obstacles, not facade, and are dropped."""
+    behind them are obstacles, not facade, and are dropped.
+
+    All patches are scored in one pass (bincount over the label image), so a
+    real facade with thousands of small bumps costs no more than one with two.
+    """
     n, lab, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
-    keep = np.zeros_like(mask)
-    for i in range(1, n):
-        comp = lab == i
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area < min_cells or filled[comp].mean() < min_fill:
-            continue
-        if wall_behind is not None and wall_behind[comp].mean() > max_wall_behind:
-            continue
-        keep |= comp
-    return keep
+    if n <= 1:
+        return np.zeros_like(mask)
+    area = stats[:, cv2.CC_STAT_AREA].astype(np.float64)
+    flat = lab.ravel()
+    fill = np.bincount(flat, weights=filled.ravel().astype(np.float64), minlength=n) / np.maximum(area, 1)
+    ok = (area >= min_cells) & (fill >= min_fill)
+    if wall_behind is not None:
+        behind = np.bincount(flat, weights=wall_behind.ravel().astype(np.float64), minlength=n) / np.maximum(area, 1)
+        ok &= behind <= max_wall_behind
+    ok[0] = False
+    return ok[lab]
 
 
 def sky_mask(filled: np.ndarray, closing_cells: int) -> np.ndarray:
@@ -326,13 +331,11 @@ def build_depth_map(wall_pts: np.ndarray, width_m: float, height_m: float, *,
         next_id = 0
         for k in range(nlab):
             n, lab = cv2.connectedComponents(((label == k) & ~structure).astype(np.uint8), connectivity=4)
-            for i in range(1, n):
-                segments[lab == i] = next_id
-                next_id += 1
+            segments = np.where(lab > 0, lab - 1 + next_id, segments)
+            next_id += n - 1
         n, lab = cv2.connectedComponents(structure.astype(np.uint8), connectivity=8)
-        for i in range(1, n):
-            segments[lab == i] = next_id
-            next_id += 1
+        segments = np.where(lab > 0, lab - 1 + next_id, segments).astype(np.int32)
+        next_id += n - 1
         info.update({
             "layers": [_layer_info(c, (label == k) & ~structure, uc, vc) for k, c in enumerate(layers)],
             "structure_fraction": round(float(structure.mean()), 4),
