@@ -62,7 +62,7 @@ class FacadeOptions:
                     "occlusion_abs_tol_m": "abs_tol_m", "occlusion_rel_tol": "rel_tol"}
         vis = VisibilityConfig(**{vis_keys[k]: data.pop(k) for k in list(data) if k in vis_keys})
         ref_keys = {"refine_depth": "enabled", "refine_cell_mm": "cell_m", "refine_search_m": "search_m",
-                    "refine_top_k": "top_k", "refine_min_confidence": "min_confidence"}
+                    "refine_top_k": "top_k", "refine_min_segment_drop": "min_segment_drop"}
         ref_args = {ref_keys[k]: data.pop(k) for k in list(data) if k in ref_keys}
         if "cell_m" in ref_args:
             ref_args["cell_m"] = float(ref_args["cell_m"]) / 1000.0

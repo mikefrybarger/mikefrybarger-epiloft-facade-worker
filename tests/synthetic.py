@@ -65,6 +65,18 @@ def undistort_brown(xd, yd, c):
     return x, y
 
 
+STOREFRONT = {"enabled": False}
+STORE_V, STORE_W = 1.9, -0.25                       # glass line 25 cm behind the band above
+WINDOWS = [(0.4, 2.6, 0.3, 1.7), (3.4, 5.6, 0.3, 1.7)]   # u0, u1, v0, v1
+
+
+def in_window(u, v):
+    m = np.zeros(np.shape(u), dtype=bool)
+    for u0, u1, v0, v1 in WINDOWS:
+        m |= (u > u0) & (u < u1) & (v > v0) & (v < v1)
+    return m
+
+
 def render(R, C, gain, shade=None):
     size = max(IMG_W, IMG_H)
     pxs, pys = np.meshgrid(np.arange(IMG_W, dtype=float), np.arange(IMG_H, dtype=float))
@@ -80,8 +92,18 @@ def render(R, C, gain, shade=None):
     t_wall = -(rel @ W) / np.where(np.abs(denom) < 1e-9, 1e-9, denom)
     hit = C + t_wall[..., None] * rays
     hu, hv = (hit - ORIGIN) @ U, (hit - ORIGIN) @ V
+    if STOREFRONT["enabled"]:   # lower storey set back: glass line behind the band above
+        t_low = -(rel @ W - STORE_W) / np.where(np.abs(denom) < 1e-9, 1e-9, denom)
+        hit_l = C + t_low[..., None] * rays
+        lu, lv = (hit_l - ORIGIN) @ U, (hit_l - ORIGIN) @ V
+        use_low = (hv < STORE_V) & (lv < STORE_V)
+        t_wall = np.where(use_low, t_low, t_wall)
+        hu, hv = np.where(use_low, lu, hu), np.where(use_low, lv, hv)
     on_wall = (t_wall > 0) & (hu >= -0.5) & (hu <= WALL_W + 0.5) & (hv >= -0.5) & (hv <= WALL_H + 0.5)
     img = np.where(on_wall[..., None], wall_texture(hu, hv), SKY)
+    if STOREFRONT["enabled"]:   # glass reflects something different from every camera
+        refl = 18.0 * np.sin(0.9 * C[0] + 0.6 * C[1] + 2.0 * hu)
+        img = np.where((on_wall & in_window(hu, hv))[..., None], img + refl[..., None], img)
     # vertical post (infinite cylinder clipped to wall height + 0.5)
     post_c = ORIGIN + POST_U * U + POST_W * W
     d2 = rays[..., :2]
@@ -143,6 +165,15 @@ def point_cloud(spacing=0.03, seed=0, post_ring=24, post_step=0.03, ground=False
     post_c = ORIGIN + POST_U * U + POST_W * W
     post = np.stack([post_c[0] + POST_R * np.cos(aa.ravel()), post_c[1] + POST_R * np.sin(aa.ravel()),
                      ORIGIN[2] + zz.ravel()], -1)
+    if STOREFRONT["enabled"]:
+        uf, vf = (wall - ORIGIN) @ U, (wall - ORIGIN) @ V
+        low = vf < STORE_V
+        wall = wall + np.where(low, STORE_W, 0.0)[:, None] * W
+        glass = low & in_window(uf, vf)
+        keep = ~glass | (rng.random(len(wall)) < 0.06)
+        wall = np.where(glass[:, None], wall - 0.6 * W, wall)[keep]     # a few interior points
+        su, sw = np.meshgrid(np.arange(0, WALL_W, spacing), np.arange(STORE_W, 0, spacing))
+        wall = np.concatenate([wall, world_wall(su.ravel(), np.full(su.size, STORE_V), sw.ravel())])
     parts = [wall, post]
     if building:  # the rest of the building behind the facade: back wall, roof, ends
         s2 = 0.06
