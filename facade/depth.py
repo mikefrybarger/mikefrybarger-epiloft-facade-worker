@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from .images import remap
+
 GROUND_BAND_M = 0.35      # bottom of the wall where points in front are taken as ground
 GROUND_FRONT_M = 0.06
 NEAR_PLANE_M = 0.05       # within this of the wall plane = wall
@@ -52,23 +54,20 @@ class DepthMap:
         shape = u.shape
         mx = (u / self.cell_m - 0.5).astype(np.float32)
         my = ((self.height_m - v) / self.cell_m - 0.5).astype(np.float32)
-        if u.ndim != 2:
-            mx, my = mx.reshape(1, -1), my.reshape(1, -1)
         return mx, my, shape
 
     def sample(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
         if self.grid.size == 1:
             return np.full(np.shape(u), float(self.grid.flat[0]), dtype=np.float64)
         mx, my, shape = self._maps(u, v)
-        out = cv2.remap(self.grid, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        out = remap(self.grid, mx, my, cv2.INTER_LINEAR)
         return out.astype(np.float64).reshape(shape)
 
     def valid_at(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
         if self.valid is None or self.valid.all():
             return np.ones(np.shape(u), dtype=bool)
         mx, my, shape = self._maps(u, v)
-        out = cv2.remap(self.valid.astype(np.uint8), mx, my, cv2.INTER_NEAREST,
-                        borderMode=cv2.BORDER_REPLICATE)
+        out = remap(self.valid.astype(np.uint8), mx, my, cv2.INTER_NEAREST)
         return out.astype(bool).reshape(shape)
 
     def stats(self) -> dict:
@@ -227,6 +226,9 @@ def build_depth_map(wall_pts: np.ndarray, width_m: float, height_m: float, *,
 
     sky = sky_mask(filled, max(3, int(round(0.3 / cell_m))))
     info["sky_fraction"] = round(float(sky.mean()), 4)
+    if sky.any():  # trim the ragged fringe where the parapet meets the sky
+        k = max(1, int(round(0.04 / cell_m)))
+        sky = cv2.dilate(sky.astype(np.uint8), np.ones((2 * k + 1, 2 * k + 1), np.uint8)).astype(bool)
     # The surface can only be inside the search band; never let filtering
     # or filling put it anywhere else.
     grid = np.clip(grid, -depth_back_m, depth_front_m).astype(np.float32)

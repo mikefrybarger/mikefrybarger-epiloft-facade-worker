@@ -24,9 +24,10 @@ from .depth import build_depth_map, flat_depth
 from .diagnostics import camera_check, overlay
 from .georef import local_snap
 from .geometry import OrthoGrid, WallPlane
-from .images import ImageCache, read_image
+from .images import ImageCache, read_image, remap
 from .refine import RefineConfig, refine_depth
-from .selection import SelectionConfig, mode_filter, prefilter_shots, score_views, solve_gains
+from .selection import (SelectionConfig, local_gain_fields, mode_filter, prefilter_shots, score_views,
+                        solve_gains)
 from .side import choose_side
 from .visibility import VisibilityConfig, ZBuffer, auto_downscale
 
@@ -41,7 +42,9 @@ class FacadeOptions:
     depth_cell_mm: float | None = None   # None = from point density
     coarse_long_edge: int = 400          # coarse selection grid cells on the long edge
     tile_px: int = 1024
-    blend_levels: int = 5
+    blend_levels: int = 6
+    local_gains: bool = True             # level brightness within photos, not just between them
+    local_gain_sigma_m: float = 0.6
     max_output_megapixels: float = 600.0
     max_occluder_points: int = 8_000_000
     image_cache_gb: float = 8.0
@@ -307,8 +310,7 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         ok = np.isfinite(scores[j])
         mx = np.where(ok, (px + 0.5) * fx - 0.5, -1.0).astype(np.float32)
         my = np.where(ok, (py + 0.5) * fy - 0.5, -1.0).astype(np.float32)
-        samples[j] = cv2.remap(small, mx, my, cv2.INTER_LINEAR,
-                               borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+        samples[j] = remap(small, mx, my, cv2.INTER_LINEAR).astype(np.float32)
     del projections
 
     valid = np.isfinite(scores)
@@ -368,6 +370,10 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
     # --- stage 5a: exposure gains ---------------------------------------------
     flat_valid = valid.reshape(len(kept), -1)
     gains = solve_gains(samples.reshape(len(kept), -1, 3), flat_valid, sel)
+    gain_fields = None
+    if opts.local_gains:
+        gain_fields = local_gain_fields(samples, valid, gains,
+                                        sigma_cells=max(1.0, opts.local_gain_sigma_m / coarse_cell))
 
     cache = ImageCache(int(opts.image_cache_gb * 1024 ** 3))
 
@@ -417,9 +423,13 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
             f = 2.0 ** level
             mx = np.where(ok, (px + 0.5) / f - 0.5, -1.0).astype(np.float32)
             my = np.where(ok, (py + 0.5) / f - 0.5, -1.0).astype(np.float32)
-            sampled = cv2.remap(src, mx, my, cv2.INTER_CUBIC,
-                                borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
-            imgs.append(sampled * gains[k][None, None, :].astype(np.float32))
+            sampled = remap(src, mx, my, cv2.INTER_CUBIC).astype(np.float32)
+            gk = gains[k][None, None, :].astype(np.float32)
+            if gain_fields is not None:
+                fx = np.clip(u / coarse_cell - 0.5, 0, cgrid.width_px - 1).astype(np.float32)
+                fy = np.clip((plane.height_m - v) / coarse_cell - 0.5, 0, cgrid.height_px - 1).astype(np.float32)
+                gk = gk * remap(gain_fields[k], fx, fy, cv2.INTER_LINEAR)
+            imgs.append(sampled * gk)
             fscores.append(np.where(ok, sc, -np.inf))
             fvalid.append(ok)
             used_gsd[k].append(gm)

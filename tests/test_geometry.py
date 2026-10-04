@@ -174,3 +174,18 @@ def test_windows_stay_on_the_wall_and_posts_are_obstacles():
     assert abs(s(3.0, 1.6)) < 0.02, s(3.0, 1.6)      # window: wall plane
     assert abs(s(5.0, 1.5)) < 0.02, s(5.0, 1.5)      # behind the post: wall plane
     assert abs(s(7.5, 3.3) - 0.25) < 0.03, s(7.5, 3.3)   # sign keeps its depth
+
+
+def test_remap_handles_maps_past_opencvs_size_limit():
+    """Regression: the refinement passed a 1-row map of every point on a 49 m
+    wall to cv2.remap, which rejects any side >= 32,767."""
+    from facade.images import remap
+
+    img = (np.arange(200 * 300, dtype=np.float32) % 251).reshape(200, 300)
+    rng = np.random.default_rng(0)
+    n = 100_003
+    xs, ys = rng.integers(0, 300, n), rng.integers(0, 200, n)
+    out = remap(img, xs.astype(np.float32), ys.astype(np.float32))
+    assert out.shape == (n,) and np.array_equal(out, img[ys, xs])
+    col = remap(np.dstack([img] * 3), xs.astype(np.float32)[None], ys.astype(np.float32)[None])
+    assert col.shape == (1, n, 3) and np.array_equal(col[0, :, 1], img[ys, xs])

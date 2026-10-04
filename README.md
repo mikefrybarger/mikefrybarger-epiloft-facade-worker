@@ -128,7 +128,8 @@ All optional. Unknown keys are rejected so a typo never silently does nothing.
 | `max_cameras` | 80 | Photos used per wall. |
 | `top_per_cell` | 6 | Photos occlusion-checked per wall spot per round. All candidates are scored on geometry first; only likely winners get the expensive occlusion check. |
 | `edge_margin` | 0.02 | Fraction of each frame edge ignored. |
-| `blend_levels` | 5 | Pyramid levels. More = wider brightness blending across seams. |
+| `blend_levels` | 6 | Pyramid levels. More = wider brightness blending across seams. |
+| `local_gains` | true | Level brightness and tint *within* photos (lens falloff, sun angle) against the per-spot consensus, smoothed over `local_gain_sigma_m` (0.6 m). Removes blotchy plain walls. |
 | `gain_sigma_g` | 1.0 | Exposure gain prior. Lower pulls gains toward 1 (OpenCV uses 0.1, which leaves real exposure steps visible). Gains are then rescaled so their overlap-weighted geometric mean is 1, so levelling never darkens the facade. |
 | `zbuffer_cells_per_spacing` | 1.5 | Occlusion z-buffer cell size, in point spacings. |
 | `zbuffer_downscale` | auto | Force the z-buffer cell size in source pixels. |
