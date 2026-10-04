@@ -150,7 +150,7 @@ BUILDING_DEPTH = 8.0
 
 
 def point_cloud(spacing=0.03, seed=0, post_ring=24, post_step=0.03, ground=False, dropout=0.0,
-                building=False):
+                building=False, details=False):
     rng = np.random.default_rng(seed)
     uu, vv = np.meshgrid(np.arange(0, WALL_W, spacing), np.arange(0, WALL_H, spacing))
     wall = world_wall(uu.ravel(), vv.ravel(), rng.normal(0, 0.004, uu.size))
@@ -175,6 +175,13 @@ def point_cloud(spacing=0.03, seed=0, post_ring=24, post_step=0.03, ground=False
         su, sw = np.meshgrid(np.arange(0, WALL_W, spacing), np.arange(STORE_W, 0, spacing))
         wall = np.concatenate([wall, world_wall(su.ravel(), np.full(su.size, STORE_V), sw.ravel())])
     parts = [wall, post]
+    if details:  # sills and mullion frames standing a few cm off the wall
+        for vs in (0.9, 2.1):
+            su, sw = np.meshgrid(np.arange(0, WALL_W, 0.01), np.arange(0.01, 0.15, 0.01))
+            parts.append(world_wall(su.ravel(), np.full(su.size, vs), sw.ravel()))
+        for uf in np.arange(0.5, WALL_W, 1.0):
+            fv, fw = np.meshgrid(np.arange(0, WALL_H, 0.01), np.arange(0.01, 0.07, 0.01))
+            parts.append(world_wall(np.full(fv.size, uf), fv.ravel(), fw.ravel()))
     if building:  # the rest of the building behind the facade: back wall, roof, ends
         s2 = 0.06
         bu, bv = np.meshgrid(np.arange(0, WALL_W, s2), np.arange(0, WALL_H, s2))

@@ -39,6 +39,9 @@ class FacadeOptions:
     depth_back_m: float = 1.0            # and behind it (door alcoves, recessed entries)
     planar_prior: bool = True            # wall is a plane unless a solid structure says otherwise
     local_snap: bool = True              # fine pose snap onto the cloud at the wall
+    facade_detail_m: float = 0.30        # cloud points this close in front of the surface are facade, not obstacles
+    single_photo_max_m2: float = 15.0    # signs / storefront pieces up to this size come from one photo
+    single_photo_max_width_m: float = 8.0
     depth_cell_mm: float | None = None   # None = from point density
     coarse_long_edge: int = 400          # coarse selection grid cells on the long edge
     tile_px: int = 1024
@@ -233,6 +236,20 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
     timings["depth_seconds"] = round(time.time() - phase, 1)
     _log(progress, f"Surface depth: {depth.source}")
     diagnostics["side"] = side_report
+    # Sills, frames, gates, sign undersides and channel letters stand a few cm
+    # off the surface; they are the facade, not obstacles. Treating them as
+    # occluders punched white holes along every sill and sign bottom.
+    if len(occluders) and depth.point_count > 0 and opts.facade_detail_m > 0:
+        ow = plane.to_wall(occluders)
+        inside = ((ow[:, 0] >= 0) & (ow[:, 0] <= plane.width_m)
+                  & (ow[:, 1] >= 0) & (ow[:, 1] <= plane.height_m))
+        detail = np.zeros(len(occluders), dtype=bool)
+        if inside.any():
+            ds = depth.sample(ow[inside, 0], ow[inside, 1])
+            detail[inside] = ow[inside, 2] - ds < opts.facade_detail_m
+        occluders = occluders[~detail]
+        diagnostics["facade_detail_points"] = int(detail.sum())
+        del ow
     if len(occluders) == 0:
         warnings.append("no point cloud for occlusion checks; objects in front of the wall may smear onto it")
 
@@ -389,6 +406,40 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         diagnostics["refine"] = refine_info
         timings["refine_seconds"] = round(time.time() - phase, 1)
 
+    # --- one photo per sign / small facade region ---------------------------
+    # A seam through lettering is where any leftover misregistration shows
+    # (doubled letters). Regions small enough to be covered by one photo are
+    # painted from the single best photo that covers almost all of them, so
+    # seams fall on region edges, where the depth already jumps.
+    if depth.segments is not None and len(kept) > 1:
+        seg_c = depth.segment_at(cu, cv)
+        ok_seg = seg_c >= 0
+        sflat = np.where(ok_seg, seg_c, 0).ravel()
+        nseg = int(sflat.max()) + 1
+        cells = np.bincount(sflat, weights=ok_seg.ravel().astype(np.float64), minlength=nseg)
+        umin = np.full(nseg, np.inf)
+        umax = np.full(nseg, -np.inf)
+        np.minimum.at(umin, sflat[ok_seg.ravel()], cu.ravel()[ok_seg.ravel()])
+        np.maximum.at(umax, sflat[ok_seg.ravel()], cu.ravel()[ok_seg.ravel()])
+        small = ((cells * coarse_cell ** 2 <= opts.single_photo_max_m2)
+                 & (umax - umin <= opts.single_photo_max_width_m) & (cells >= 4))
+        best_total = np.full(nseg, -np.inf)
+        best_k = np.full(nseg, -1)
+        for k in range(len(kept)):
+            vk = (valid[k] & ok_seg).ravel()
+            cover = np.bincount(sflat, weights=vk.astype(np.float64), minlength=nseg) / np.maximum(cells, 1)
+            total = np.bincount(sflat, weights=np.where(vk, scores[k].ravel(), 0.0), minlength=nseg)
+            better = (cover >= 0.9) & (total > best_total)
+            best_total = np.where(better, total, best_total)
+            best_k = np.where(better, k, best_k)
+        chosen = small & (best_k >= 0)
+        pick = np.where(ok_seg, best_k[seg_c], -1)
+        apply = ok_seg & chosen[np.where(ok_seg, seg_c, 0)]
+        for k in np.unique(pick[apply]):
+            m = apply & (pick == k) & valid[k]
+            coarse_labels[m] = k
+        diagnostics["single_photo_regions"] = int(chosen.sum())
+
     # --- stage 5b: fine pass, tile by tile ------------------------------------
     phase = time.time()
     out_path = Path(workdir) / "facade_rgba.u8"
@@ -397,6 +448,7 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
     tile = opts.tile_px
     tiles = [(r, c) for r in range(0, grid.height_px, tile) for c in range(0, grid.width_px, tile)]
     used_pixels = np.zeros(len(kept), dtype=np.int64)
+    fallback_pixels = 0
     used_gsd = [[] for _ in kept]
     for ti, (r0, c0) in enumerate(tiles):
         r1, c1 = min(r0 + tile, grid.height_px), min(c0 + tile, grid.width_px)
@@ -411,18 +463,19 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         th, tw = u.shape
         if not tile_cams:
             continue
-        imgs, fscores, fvalid = [], [], []
+        imgs, fscores, fvalid, finframe = [], [], [], []
         for k in tile_cams:
             shot = kept[k]
             px, py, d = shot.project(pts)
             sc, g = score_views(shot, pts, plane.w, px, py, d, sel)
-            ok = np.isfinite(sc) & zbuffers[shot.name].visible(px, py, d)
+            inframe = np.isfinite(sc)
+            ok = inframe & zbuffers[shot.name].visible(px, py, d)
             gm = float(np.nanmedian(np.where(ok, g, np.nan))) if ok.any() else gsd_m
             level = int(np.clip(math.floor(math.log2(max(gsd_m / max(gm, 1e-9), 1.0))), 0, 4))
             src = cache.get(shot, level)
             f = 2.0 ** level
-            mx = np.where(ok, (px + 0.5) / f - 0.5, -1.0).astype(np.float32)
-            my = np.where(ok, (py + 0.5) / f - 0.5, -1.0).astype(np.float32)
+            mx = np.where(inframe, (px + 0.5) / f - 0.5, -1.0).astype(np.float32)
+            my = np.where(inframe, (py + 0.5) / f - 0.5, -1.0).astype(np.float32)
             sampled = remap(src, mx, my, cv2.INTER_CUBIC).astype(np.float32)
             gk = gains[k][None, None, :].astype(np.float32)
             if gain_fields is not None:
@@ -432,8 +485,9 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
             imgs.append(sampled * gk)
             fscores.append(np.where(ok, sc, -np.inf))
             fvalid.append(ok)
+            finframe.append(np.where(inframe, sc, -np.inf))
             used_gsd[k].append(gm)
-        fscores, fvalid = np.stack(fscores), np.stack(fvalid)
+        fscores, fvalid, finframe = np.stack(fscores), np.stack(fvalid), np.stack(finframe)
         # coarse choice where that photo really sees the pixel, best fine score otherwise
         idx = np.full(coarse.shape, -1, dtype=np.int64)
         for j, k in enumerate(tile_cams):
@@ -441,12 +495,20 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         need = (idx < 0) & fvalid.any(axis=0)
         if need.any():
             idx[need] = fscores.argmax(axis=0)[need]
+        # every view blocked (usually cloud noise, not a real obstacle): use the
+        # best photo anyway rather than leave a hole; only sky stays clear
+        blocked = (idx < 0) & np.isfinite(finframe).any(axis=0)
+        if blocked.any():
+            idx[blocked] = finframe.argmax(axis=0)[blocked]
+            fallback_pixels += int(blocked[margin:margin + (r1 - r0), margin:margin + (c1 - c0)].sum())
         covered_t = (idx >= 0) & depth.valid_at(u, v)     # sky above the parapet stays clear
         composite = np.zeros((th, tw, 3), np.float32)
         for j in range(len(tile_cams)):
             composite[idx == j] = imgs[j][idx == j]
         masks = []
         for j in range(len(tile_cams)):
+            # outside what a photo truly sees (blocked or out of frame), it
+            # contributes the composite, so occluders never leak into the blend
             imgs[j][~fvalid[j]] = composite[~fvalid[j]]
             masks.append((idx == j).astype(np.float32))
         blended = multiband_blend(imgs, masks, opts.blend_levels) if len(tile_cams) > 1 else composite
@@ -465,6 +527,7 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
     timings["render_seconds"] = round(time.time() - phase, 1)
 
     coverage = float((out[..., 3] > 0).mean())
+    diagnostics["blocked_view_fallback_pixels"] = fallback_pixels
     if coverage < 0.98:
         warnings.append(f"{(1 - coverage) * 100:.1f}% of the wall had no unobstructed photo and is transparent")
 

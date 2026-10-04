@@ -121,6 +121,8 @@ All optional. Unknown keys are rejected so a typo never silently does nothing.
 | `planar_prior` | true | Wall is a plane unless a solid structure says otherwise. |
 | `refine_depth` | true | Photo-consistency depth refinement. `refine_search_m` (0.15), `refine_cell_mm` (30), `refine_top_k` (4), `refine_min_segment_drop` (0.02). One correction per facade region, never per patch. |
 | `local_snap` | true | Fine pose snap onto the cloud at the wall. |
+| `facade_detail_m` | 0.30 | Cloud points this close in front of the surface (sills, frames, gates, sign undersides) are facade, not obstacles. |
+| `single_photo_max_m2` / `single_photo_max_width_m` | 15 / 8 | Signs and facade regions up to this size are painted from one photo, so seams never cross lettering. |
 | `depth_cell_mm` | auto | Depth grid cell. Auto = 1.5x the point spacing on the wall, 10 to 100 mm. |
 | `use_point_cloud` | true | False = flat plane, no occlusion. Only for debugging. |
 | `max_incidence_deg` | 65 | Views more oblique than this are not used. |

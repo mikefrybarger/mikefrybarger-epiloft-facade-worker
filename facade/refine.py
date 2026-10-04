@@ -115,8 +115,8 @@ def refine_depth(plane, depth: DepthMap, shots, zbuffers, gains, cache, sel, cfg
     # One correction per region (a facade layer piece, a sign, a column), from
     # every cell in it. Patch-by-patch corrections jitter on glass, whose
     # reflections differ in every photo; a whole region cannot wobble.
-    seg = depth.segment_at(u, v)
-    seg = np.where(seg >= 0, seg, seg.max() + 1 if seg.size else 0)
+    seg_raw = depth.segment_at(u, v)
+    seg = np.where(seg_raw >= 0, seg_raw, seg_raw.max() + 1 if seg_raw.size else 0)
     nseg = int(seg.max()) + 1
     sf = seg[full]
     sums = np.stack([np.bincount(sf, weights=norm[j][full], minlength=nseg) for j in range(D)])  # (D, S)
@@ -168,4 +168,5 @@ def refine_depth(plane, depth: DepthMap, shots, zbuffers, gains, cache, sel, cfg
                        coverage=depth.coverage, point_count=depth.point_count,
                        source=depth.source + " + photo consistency",
                        valid=valid, info={**depth.info, "refine": info})
+    refined.segments = seg_raw.astype(np.int32) if depth.segments is not None else None
     return refined, info

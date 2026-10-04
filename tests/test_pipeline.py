@@ -531,3 +531,16 @@ def test_stepped_storefront_with_glass_does_not_wobble(tmp_path, monkeypatch):
     psnr, shift = _compare(rgba, 0.005)
     assert psnr > 27, psnr
     assert abs(shift[0]) < 0.5 and abs(shift[1]) < 0.5, shift
+
+
+def test_sills_and_frames_do_not_punch_holes(tmp_path):
+    """Regression: sills, frames and sign undersides a few cm off the surface
+    were treated as obstacles and left white "snow" holes along every sill."""
+    root = tmp_path / "odm"
+    syn.build_project(root, cloud={"details": True})
+    sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5)
+    assert sidecar["diagnostics"]["facade_detail_points"] > 10_000
+    assert (rgba[..., 3] > 0).mean() > 0.995, (rgba[..., 3] > 0).mean()
+    psnr, _ = _compare(rgba, 0.005)
+    assert psnr > 27, psnr
+    assert _post_fraction(rgba[..., :3], rgba[..., 3]) < 0.0005     # real obstacles still removed
