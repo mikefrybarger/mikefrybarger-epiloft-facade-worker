@@ -15,8 +15,9 @@ this one is **CPU only**.
 |---|---|---|
 | 1 Cameras | Poses and lens models from `opensfm/reconstruction.json`, projected with OpenSfM's own conventions (perspective, brown, fisheye, fisheye_opencv, radial, simple_radial). | `facade/cameras.py` |
 | 2 Grid | The picked corners become a wall frame: U along the wall, V up, W out toward the cameras. Corners picked "inside out" are flipped so the image always reads left to right from outside. | `facade/geometry.py` |
-| 3 Depth | Piecewise planar. The dense cloud is rasterised on the plane (robust frontmost depth, sidewalk at the base dropped, sparse "through the glass" cells ignored). Up to four facade layers are found from the depth histogram (glass line, stucco band, sign band) and fitted as planes with at most 5 mm/m lean. Solid structures (signs, columns, towers, alcoves: connected, big, densely measured, no wall visible behind) keep their own depth. Every cell belongs to one region. Free-standing posts are obstacles; sky above the parapet is transparent. | `facade/depth.py` |
+| 3 Depth | Piecewise planar. The dense cloud is rasterised on the plane (robust frontmost depth, sidewalk at the base dropped, sparse "through the glass" cells ignored). Up to four facade layers are found from the depth histogram (glass line, stucco band, sign band) and fitted as planes with at most 5 mm/m lean. Solid structures (signs, columns, towers, alcoves: connected, big, densely measured, no wall visible behind) keep their own depth. Every cell belongs to one region; each gap in the cloud (a window, storefront glass up to 30 m²) takes the single most common layer around its edge, so a window never switches depth halfway down. Free-standing posts are obstacles; sky above the parapet is transparent. | `facade/depth.py` |
 | 4b Refine | Photo consistency, one correction per region: the depth of each region is swept a few cm and the overlapping photos compared over the whole region. Removes cloud/pose mismatch (ghosted lettering) without letting glass reflections wobble the surface. | `facade/refine.py` |
+| 4c Align | Image-based local alignment, for oblique captures (DJI Smart 3D). Every photo is rendered onto the wall at 1 cm/px, a consensus is formed from the per-pixel median of the photos that see each spot, and dense optical flow (DIS) measures how far each photo's detail sits from it. The correction is trusted only where there is texture, smoothed over 25 cm, capped at 8 cm, refined in two rounds and applied when the facade is rendered. Removes doubled numbers and ghosted lettering at seams between photos shot from different angles. | `facade/align.py` |
 | 4 Choice | Every candidate photo is scored per spot: square-on, close, and near the frame centre wins. A point-cloud z-buffer per photo rejects views blocked by trees, posts and overhangs. The winner map is smoothed so seams follow regions. | `facade/selection.py`, `facade/visibility.py` |
 | 5 Blend | Per-photo exposure gains are solved from overlaps, then a Laplacian-pyramid blend hides the seams without ghosting fine detail. Output is built in tiles, so wall size is bounded by disk, not RAM. | `facade/selection.py`, `facade/blend.py`, `facade/pipeline.py` |
 | 6 Outputs | Tiled BigTIFF, sidecar JSON, JPEG preview, optional deep-zoom tiles. | `facade/outputs.py` |
@@ -119,6 +120,7 @@ All optional. Unknown keys are rejected so a typo never silently does nothing.
 |---|---|---|
 | `depth_front_m` / `depth_back_m` | 1.2 / 1.0 | How far in front of / behind the picked plane to look for the real surface. |
 | `planar_prior` | true | Wall is a plane unless a solid structure says otherwise. |
+| `align_photos` | true | Image-based local alignment between photos (stage 4c). `align_max_shift_m` (0.08), `align_smooth_m` (0.25), `align_res_mm` (10), `align_iterations` (2). Turn off only to compare. |
 | `refine_depth` | true | Photo-consistency depth refinement. `refine_search_m` (0.15), `refine_cell_mm` (30), `refine_top_k` (4), `refine_min_segment_drop` (0.02). One correction per facade region, never per patch. |
 | `local_snap` | true | Fine pose snap onto the cloud at the wall. |
 | `facade_detail_m` | 0.30 | Cloud points this close in front of the surface (sills, frames, gates, sign undersides) are facade, not obstacles. |
@@ -183,6 +185,10 @@ The worker can only use photos that face the wall. For each elevation:
   4 m and 2.7 mm/px at 10 m.
 - Add a few photos from slightly left and right where trees or posts stand in
   front of the wall, so something sees behind them.
+- DJI Smart 3D captures work: many photos are oblique, and the alignment
+  stage (4c) reconciles them. `diagnostics.align` reports the typical and
+  largest correction; more than 5 cm typical means poses or depth are well
+  off and the reconstruction is worth a look.
 - Nadir mapping photos are ignored for facades; they still help the
   reconstruction.
 
@@ -225,6 +231,9 @@ check the output pixel for pixel:
 - poses in the topocentric frame with no marker file (the Lightning case) are
   detected against the LAZ or the textured mesh and land sub-pixel; a PLY in
   the original frame moves with them; an unverifiable frame is explained
+- photos with independent 2.5 cm pose errors (Smart 3D style disagreement)
+  gain over 3 dB with alignment; photos that already agree are left alone
+- a window whose sill touches a recessed layer still gets one depth
 - LAZ point clouds, deep-zoom tiles, the RunPod handler with signed URL upload and refresh
 
 ## Before the first customer job

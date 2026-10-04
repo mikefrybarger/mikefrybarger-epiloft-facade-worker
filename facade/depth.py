@@ -35,6 +35,7 @@ GROUND_FRONT_M = 0.06
 NEAR_PLANE_M = 0.05       # within this of the wall plane = wall
 MIN_STRUCT_AREA_M2 = 0.12
 MIN_RECESS_AREA_M2 = 0.4
+MAX_HOLE_M2 = 30.0             # gaps up to this size (windows, storefront glass) get one depth
 MIN_STRUCT_FILL = 0.55    # fraction of a structure's cells that must hold real points
 
 
@@ -330,8 +331,9 @@ def build_depth_map(wall_pts: np.ndarray, width_m: float, height_m: float, *,
         if not known.any():
             known = reliable
             label = np.where(reliable, best, -1)
-        label = fill_nearest(label, known)
         nlab = len(layers)
+        label = _fill_holes_by_majority(label, known, nlab, int(MAX_HOLE_M2 / (cell_m * cell_m)))
+        label = fill_nearest(label, label >= 0)
         # tidy layer labels: majority vote so layers form regions, not speckle
         # straight-ish boundaries: facade layer edges run along sills and bands
         win = max(7, int(round(0.22 / cell_m)) | 1)
@@ -378,6 +380,36 @@ def build_depth_map(wall_pts: np.ndarray, width_m: float, height_m: float, *,
                   point_count=int(len(w)), source=source, valid=~sky, info=info)
     dm.segments = segments
     return dm
+
+
+def _fill_holes_by_majority(label: np.ndarray, known: np.ndarray, nlab: int, max_cells: int) -> np.ndarray:
+    """Each gap in the labels (a window, a dark awning) takes ONE layer: the most
+    common layer around its edge.
+
+    Filling cell by cell from the nearest labelled neighbour splits a window
+    between whatever touches each part of its edge (sill below, frame beside),
+    so the window bottom got a different depth from its top, and the blinds
+    and sills came out wavy where the depth switched.
+    """
+    if known.all() or nlab < 2:
+        return label
+    # speckle (sparse points, dropout) is not a window: close it first so only
+    # real gaps remain, and those get filled cell by cell later
+    k = np.ones((7, 7), np.uint8)
+    solid = cv2.morphologyEx(known.astype(np.uint8), cv2.MORPH_CLOSE, k).astype(bool) | known
+    holes = ~solid
+    n, comp = cv2.connectedComponents(holes.astype(np.uint8), connectivity=4)
+    if n <= 1:
+        return label
+    ring_id = cv2.dilate(comp.astype(np.float32), np.ones((5, 5), np.uint8)).astype(np.int64)
+    ring = known & (ring_id > 0)
+    votes = np.bincount(ring_id[ring] * nlab + label[ring], minlength=n * nlab).reshape(n, nlab)
+    size = np.bincount(comp.ravel(), minlength=n)
+    majority = np.where((votes.sum(axis=1) > 0) & (size <= max_cells), votes.argmax(axis=1), -1)
+    majority[0] = -1
+    out = label.copy()
+    out[holes] = majority[comp[holes]]
+    return out
 
 
 def fill_nearest(grid: np.ndarray, known: np.ndarray) -> np.ndarray:

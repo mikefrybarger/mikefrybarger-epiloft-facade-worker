@@ -25,6 +25,7 @@ from .diagnostics import camera_check, overlay
 from .georef import local_snap
 from .geometry import OrthoGrid, WallPlane
 from .images import ImageCache, read_image, remap
+from .align import AlignConfig, align_photos
 from .refine import RefineConfig, refine_depth
 from .selection import (SelectionConfig, local_gain_fields, mode_filter, prefilter_shots, score_views,
                         solve_gains)
@@ -55,6 +56,7 @@ class FacadeOptions:
     selection: SelectionConfig = field(default_factory=SelectionConfig)
     visibility: VisibilityConfig = field(default_factory=VisibilityConfig)
     refine: RefineConfig = field(default_factory=RefineConfig)
+    align: AlignConfig = field(default_factory=AlignConfig)
 
     @classmethod
     def from_payload(cls, data: dict | None):
@@ -70,10 +72,16 @@ class FacadeOptions:
         if "cell_m" in ref_args:
             ref_args["cell_m"] = float(ref_args["cell_m"]) / 1000.0
         ref = RefineConfig(**ref_args)
+        al_keys = {"align_photos": "enabled", "align_res_mm": "res_m", "align_max_shift_m": "max_shift_m",
+                   "align_smooth_m": "smooth_m", "align_iterations": "iterations"}
+        al_args = {al_keys[k]: data.pop(k) for k in list(data) if k in al_keys}
+        if "res_m" in al_args:
+            al_args["res_m"] = float(al_args["res_m"]) / 1000.0
+        al = AlignConfig(**al_args)
         unknown = [k for k in data if k not in cls.__dataclass_fields__]
         if unknown:
             raise ValueError(f"unknown option(s): {', '.join(sorted(unknown))}")
-        return cls(selection=sel, visibility=vis, refine=ref, **data)
+        return cls(selection=sel, visibility=vis, refine=ref, align=al, **data)
 
 
 def _camera_hint(check):
@@ -440,6 +448,20 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
             coarse_labels[m] = k
         diagnostics["single_photo_regions"] = int(chosen.sum())
 
+    # --- stage 4c: image-based local alignment (oblique / Smart 3D captures) --
+    field_al = None
+    if opts.align.enabled and len(kept) > 1:
+        phase = time.time()
+        try:
+            field_al, align_info = align_photos(plane, depth, kept, zbuffers, gains, cache, valid,
+                                                coarse_cell, native_m, opts.align,
+                                                log=lambda m: _log(progress, m))
+        except Exception as exc:  # noqa: BLE001 - never lose the job to the alignment
+            align_info = {"status": "error", "reason": str(exc)}
+            warnings.append(f"photo alignment failed ({exc}); used geometry only")
+        diagnostics["align"] = align_info
+        timings["align_seconds"] = round(time.time() - phase, 1)
+
     # --- stage 5b: fine pass, tile by tile ------------------------------------
     phase = time.time()
     out_path = Path(workdir) / "facade_rgba.u8"
@@ -466,8 +488,14 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
         imgs, fscores, fvalid, finframe = [], [], [], []
         for k in tile_cams:
             shot = kept[k]
-            px, py, d = shot.project(pts)
-            sc, g = score_views(shot, pts, plane.w, px, py, d, sel)
+            kpts = pts
+            if field_al is not None:
+                du, dv = field_al.shift(shot.name, u, v)
+                if np.any(du) or np.any(dv):
+                    us, vs = u + du, v + dv
+                    kpts = plane.to_world(us, vs, depth.sample(us, vs))
+            px, py, d = shot.project(kpts)
+            sc, g = score_views(shot, kpts, plane.w, px, py, d, sel)
             inframe = np.isfinite(sc)
             ok = inframe & zbuffers[shot.name].visible(px, py, d)
             gm = float(np.nanmedian(np.where(ok, g, np.nan))) if ok.any() else gsd_m

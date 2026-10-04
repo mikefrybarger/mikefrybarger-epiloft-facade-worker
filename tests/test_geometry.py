@@ -212,3 +212,23 @@ def test_channel_letters_keep_their_depth():
     assert gap.any()
     on_letter = d.sample(np.array([3.075]), np.array([3.3]))[0]
     assert abs(on_letter - 0.2) < 0.04, on_letter
+
+
+def test_window_gets_one_depth_not_its_edges_depths():
+    """A window (no points) whose sill sits on a recessed storefront layer and
+    whose top and sides are on the main wall must not switch depth halfway down:
+    that switch is what made blinds and window bottoms wavy."""
+    pytest.importorskip("scipy")
+    from facade.depth import build_depth_map
+    rng = np.random.default_rng(1)
+    u = rng.uniform(0, 10, 400_000)
+    v = rng.uniform(0, 5, 400_000)
+    w = np.where(v < 1.5, -0.25, 0.0) + rng.normal(0, 0.004, u.size)
+    window = (u > 3) & (u < 5) & (v > 1.2) & (v < 3.2)
+    pts = np.column_stack([u, v, w])[~window]
+    d = build_depth_map(pts, 10, 5, cell_m=0.02, depth_front_m=0.6, depth_back_m=0.5)
+    assert len(d.info["layers"]) == 2, d.info
+    uu, vv = np.meshgrid(np.linspace(3.15, 4.85, 60), np.linspace(1.35, 3.05, 60))
+    inside = d.sample(uu, vv)
+    assert np.ptp(inside) < 0.01, (inside.min(), inside.max())     # one depth for the window
+    assert abs(np.median(inside)) < 0.02                            # the main wall's, its majority edge

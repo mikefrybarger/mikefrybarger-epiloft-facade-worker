@@ -544,3 +544,54 @@ def test_sills_and_frames_do_not_punch_holes(tmp_path):
     psnr, _ = _compare(rgba, 0.005)
     assert psnr > 27, psnr
     assert _post_fraction(rgba[..., :3], rgba[..., 3]) < 0.0005     # real obstacles still removed
+
+
+def _jitter_poses(root, sigma_m, seed=3):
+    """Independent per-photo pose errors (zero mean): photos disagree with each
+    other, the way oblique Smart 3D shots do when depth and poses are a little off."""
+    p = root / "opensfm" / "reconstruction.json"
+    recon = json.loads(p.read_text())
+    rng = np.random.default_rng(seed)
+    shots = recon[0]["shots"]
+    deltas = rng.normal(0, sigma_m, (len(shots), 3))
+    deltas -= deltas.mean(axis=0)
+    deltas[:, :] -= np.outer(deltas @ syn.W, syn.W)     # in the wall plane: pure image shift
+    for shot, dlt in zip(shots.values(), deltas):
+        R = cv2.Rodrigues(np.array(shot["rotation"], float))[0]
+        c = -R.T @ np.array(shot["translation"]) + dlt
+        shot["translation"] = (-R @ c).tolist()
+    p.write_text(json.dumps(recon))
+
+
+def _ghosting(rgba, gsd_m):
+    """Detail lost to doubling: high-frequency energy of the output vs truth."""
+    h, w = rgba.shape[:2]
+    truth = cv2.cvtColor(syn.truth_image(gsd_m, w, h).astype(np.float32), cv2.COLOR_BGR2GRAY)
+    got = cv2.cvtColor(rgba[..., :3].astype(np.float32), cv2.COLOR_RGB2GRAY)
+    lap = lambda x: np.abs(cv2.Laplacian(x, cv2.CV_32F))[16:-16, 16:-16].mean()  # noqa: E731
+    return lap(got) / lap(truth)
+
+
+def test_alignment_fixes_photos_that_disagree(tmp_path):
+    root = tmp_path / "odm"
+    syn.build_project(root)
+    _jitter_poses(root, 0.025)
+    opts = {"local_snap": False, "refine_depth": False, "single_photo_max_m2": 0}
+    off, rgba_off = _run(root, tmp_path / "off", gsd_mm=5, options={**opts, "align_photos": False})
+    on, rgba_on = _run(root, tmp_path / "on", gsd_mm=5, options=opts)
+    psnr_off, _ = _compare(rgba_off, 0.005)
+    psnr_on, _ = _compare(rgba_on, 0.005)          # (periodic texture: no phase check)
+    al = on["diagnostics"]["align"]
+    assert al["status"] == "ok", al
+    assert 0.01 < al["p90_shift_m_median"] < 0.08, al
+    assert psnr_on > psnr_off + 3, (psnr_off, psnr_on, al)
+    assert _ghosting(rgba_on, 0.005) > _ghosting(rgba_off, 0.005), "alignment should restore detail"
+
+
+def test_alignment_leaves_agreeing_photos_alone(project, tmp_path):
+    sidecar, rgba = _run(project, tmp_path, gsd_mm=5)
+    al = sidecar["diagnostics"]["align"]
+    assert al["status"] == "ok", al
+    assert al["p90_shift_m_max"] < 0.012, al        # nothing to correct, nothing invented
+    psnr, _ = _compare(rgba, 0.005)
+    assert psnr > 30, psnr
