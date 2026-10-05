@@ -464,6 +464,12 @@ def run_facade(project, plane: WallPlane, opts: FacadeOptions, workdir: Path, pr
             warnings.append(f"photo alignment failed ({exc}); used geometry only")
         diagnostics["align"] = align_info
         timings["align_seconds"] = round(time.time() - phase, 1)
+        sat = align_info.get("photos_at_cap", 0)
+        if align_info.get("photos") and sat >= max(3, 0.5 * align_info["photos"]):
+            warnings.append(
+                f"photo alignment hit its limit on {sat} of {align_info['photos']} photos: the depth model or "
+                "poses are off by more than alignment may correct, expect doubled detail. Check "
+                "depth.wall_tilt_mm_per_m and diagnostics.refine; send this report")
 
     # --- stage 5b: fine pass, tile by tile ------------------------------------
     phase = time.time()

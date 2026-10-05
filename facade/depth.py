@@ -154,6 +154,59 @@ def fit_wall_plane(depth: np.ndarray, cell_m: float, height_m: float, iters: int
     return coef
 
 
+MAX_PICK_TILT = 0.20       # m per m: a Studio pick can lean this far off the real wall
+
+
+def wall_tilt(raw: np.ndarray, reliable: np.ndarray, cell_m: float, height_m: float, seed: int = 0):
+    """How the real wall leans relative to the picked plane: (du, dv) in m per m.
+
+    The picked plane comes from three corners clicked in Studio; a top
+    corner clicked 10 cm in front of the wall leans the plane by 2-3 cm per
+    metre over a storefront's height. Facade layers are parallel to the real
+    wall, not to the pick, so this is measured first (RANSAC on the cells for
+    the plane most of the facade lies on, then least squares on its inliers)
+    and removed before anything else; layer and structure caps then apply
+    relative to the real wall. (v.4 capped every layer at 5 mm/m against the
+    pick: on Ascend Plaza all four hit the cap and the photos disagreed by cm.)"""
+    rows, cols = raw.shape
+    rr, cc = np.nonzero(reliable)
+    if rr.size < 200:
+        return 0.0, 0.0
+    rng = np.random.default_rng(seed)
+    if rr.size > 60_000:
+        pick = rng.choice(rr.size, 60_000, replace=False)
+        rr, cc = rr[pick], cc[pick]
+    u = (cc + 0.5) * cell_m
+    v = height_m - (rr + 0.5) * cell_m
+    w = raw[rr, cc].astype(np.float64)
+    a_all = np.stack([np.ones_like(u), u, v], -1)
+    best_n, best = -1, None
+    tol = 0.025
+    for _ in range(300):
+        i = rng.choice(len(u), 3, replace=False)
+        try:
+            coef = np.linalg.solve(a_all[i], w[i])
+        except np.linalg.LinAlgError:
+            continue
+        if abs(coef[1]) > MAX_PICK_TILT or abs(coef[2]) > MAX_PICK_TILT:
+            continue
+        n = int((np.abs(a_all @ coef - w) < tol).sum())
+        if n > best_n:
+            best_n, best = n, coef
+    if best is None:
+        return 0.0, 0.0
+    coef = best
+    for t in (0.03, 0.02):
+        ok = np.abs(a_all @ coef - w) < t
+        if ok.sum() < 50:
+            break
+        coef, *_ = np.linalg.lstsq(a_all[ok], w[ok], rcond=None)
+    # spans too short to measure a lean on are left alone
+    du = float(coef[1]) if np.ptp(u) > 1.0 else 0.0
+    dv = float(coef[2]) if np.ptp(v) > 1.0 else 0.0
+    return float(np.clip(du, -MAX_PICK_TILT, MAX_PICK_TILT)), float(np.clip(dv, -MAX_PICK_TILT, MAX_PICK_TILT))
+
+
 def _keep_components(mask: np.ndarray, filled: np.ndarray, min_cells: int, min_fill: float,
                      wall_behind: np.ndarray | None = None, max_wall_behind: float = 0.35,
                      dev: np.ndarray | None = None, obstacle_min_dev: float = 0.45,
@@ -315,6 +368,13 @@ def build_depth_map(wall_pts: np.ndarray, width_m: float, height_m: float, *,
     rr, cc = np.mgrid[0:rows, 0:cols]
     uc = (cc + 0.5) * cell_m
     vc = height_m - (rr + 0.5) * cell_m
+    tilt = (0.0, 0.0)
+    if planar_prior:
+        # work relative to the real wall, not the pick (added back at the end)
+        tilt = wall_tilt(raw, reliable, cell_m, height_m)
+        raw = raw - (tilt[0] * uc + tilt[1] * vc)
+        w = w - (tilt[0] * u + tilt[1] * v)
+        info["wall_tilt_mm_per_m"] = [round(tilt[0] * 1000, 2), round(tilt[1] * 1000, 2)]
     layers = find_layers(raw, reliable, cell_m, height_m) if planar_prior else []
     if layers:
         planes = np.stack([c[0] + c[1] * uc + c[2] * vc for c in layers])        # (L, rows, cols)
@@ -378,7 +438,8 @@ def build_depth_map(wall_pts: np.ndarray, width_m: float, height_m: float, *,
         })
         sky = _sky(filled, cell_m, info)
         return _assemble(comb, label, faces, layers, face_coef, lines, nlab, sky, reliable,
-                         cell_m, height_m, depth_front_m, depth_back_m, coverage, int(len(w)), source, info)
+                         cell_m, height_m, depth_front_m, depth_back_m, coverage, int(len(w)), source, info,
+                         tilt)
     else:
         grid = fill_nearest(np.where(filled, raw, 0.0), filled)
         if min(rows, cols) >= 5:
@@ -410,7 +471,7 @@ MAX_FINE_SIDE = 30_000       # OpenCV remap limit is 32,767 per side
 
 
 def _assemble(comb, label, faces, layers, face_coef, lines, nlab, sky, reliable, cell_m, height_m,
-              depth_front_m, depth_back_m, coverage, point_count, source, info):
+              depth_front_m, depth_back_m, coverage, point_count, source, info, tilt=(0.0, 0.0)):
     """Draw the piecewise-planar model on a fine raster.
 
     The analysis runs on 3-9 cm cells (what the cloud supports), but the
@@ -474,6 +535,8 @@ def _assemble(comb, label, faces, layers, face_coef, lines, nlab, sky, reliable,
         next_id += nfaces
     info["segments"] = int(next_id)
     info["analysis_cell_mm"] = round(cell_m * 1000, 2)
+    if tilt[0] or tilt[1]:
+        grid += (tilt[0] * uf + tilt[1] * vf).astype(np.float32)
     grid = np.clip(grid, -depth_back_m, depth_front_m).astype(np.float32)
     dm = DepthMap(cell_m=fine_m, height_m=height_m, grid=grid, coverage=coverage, point_count=point_count,
                   source=source, valid=up(~sky), info=info)

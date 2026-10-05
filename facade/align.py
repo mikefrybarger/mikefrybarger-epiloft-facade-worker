@@ -248,6 +248,9 @@ def align_photos(plane, depth, shots, zbuffers, gains, cache, valid_coarse, coar
         "broad_p90_m_median": round(float(np.median(broad_p90)), 4) if broad_p90 else 0.0,
         "local_p90_m_median": round(float(np.median(local_p90)), 4) if local_p90 else 0.0,
         "local_p90_m_max": round(float(np.max(local_p90)), 4) if local_p90 else 0.0,
+        # photos whose correction is pinned at a cap: alignment was not enough
+        "photos_at_cap": int(sum(b >= 0.95 * cfg.max_shift_m or l >= 0.95 * cfg.max_local_m
+                                 for b, l in zip(broad_p90, local_p90))),
         "per_iteration_m": stats,
         "grid_mm": round(cfg.res_m * 1000, 1),
     }

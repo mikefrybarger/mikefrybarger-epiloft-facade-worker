@@ -631,3 +631,26 @@ def test_wavy_cloud_edge_keeps_sills_straight(tmp_path, monkeypatch):
         assert std < 0.004 and worst < 0.012, (lo, std, worst)
     psnr, _ = _compare(rgba, 0.005)
     assert psnr > 26, psnr
+
+
+def test_leaning_pick_is_measured_not_capped(tmp_path, monkeypatch):
+    """Ascend Plaza v.4: every depth layer reported exactly the 5 mm/m lean
+    cap. The wall was picked in Studio with a top corner off the real wall, so
+    the plane leaned against the facade by more than that; the layers were
+    centimetres off top and bottom, every photo's alignment sat at both caps,
+    and the NAILS lettering doubled. The lean of the pick is measured from the
+    cloud, uncapped, and layer caps apply relative to the real wall."""
+    monkeypatch.setattr(syn, "camera_positions", syn.smart3d_positions)
+    root = tmp_path / "odm"
+    syn.build_project(root)
+    wall = syn.wall_payload(frame="opensfm")
+    wall["corners"]["top_left"] = list(map(float, syn.world_wall(0, syn.WALL_H, 0.15)))   # 5 cm/m lean
+    sidecar, rgba = _run(root, tmp_path / "out", gsd_mm=5, wall=wall)
+    d = sidecar["depth"]
+    assert abs(d["wall_tilt_mm_per_m"][1] + 50.0) < 3.0, d["wall_tilt_mm_per_m"]
+    al = sidecar["diagnostics"]["align"]
+    # v.4: broad 1.4 cm, local 1.2 cm. With the lean measured there is nothing to fix.
+    assert al["broad_p90_m_median"] < 0.006 and al["local_p90_m_median"] < 0.006, al
+    assert not any("alignment" in w for w in sidecar["warnings"]), sidecar["warnings"]
+    psnr, _ = _compare(rgba[:600], 0.005)     # (truth ignores the 0.1 % foreshortening of the leaning plane)
+    assert psnr > 25, psnr                    # v.4: 22.1
